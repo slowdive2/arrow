@@ -1,0 +1,18 @@
+# driver/Cargo.toml
+[package]
+name = "driver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hypervisor = { path = "../hypervisor" }
+wdk = "0.3"            # check current version — WDK Rust bindings, this is what matrix-rs uses
+wdk-sys = "0.3"
+wdk-alloc = "0.3"
+wdk-panic = "0.3"
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.wdk.driver-model]
+driver-type = "KMDF"

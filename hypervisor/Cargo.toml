@@ -1,0 +1,12 @@
+# hypervisor/Cargo.toml
+[package]
+name = "hypervisor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+x86 = "0.52"          # register/MSR access primitives — check latest on crates.io
+bitflags = "2"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
