@@ -12,7 +12,6 @@ use wdk_sys::{
 
 use x86::msr::{rdmsr, IA32_VMX_BASIC};
 
-use crate::vmcs::VmcsRegion;
 use crate::vmx::{
     adjust_control_regs, enable_vmx_operation, has_vmx_support, VmxRegion, VMX_REGION_SIZE,
 };
@@ -27,7 +26,7 @@ unsafe fn phys_of(ptr: *mut c_void) -> u64 {
     unsafe { MmGetPhysicalAddress(ptr).QuadPart as u64 }
 }
 pub struct Vcpu {
-    pub vmcs: *mut VmcsRegion,
+    pub vmcs: *mut VmxRegion,
     pub vmcs_physical: u64,
     pub vmxon: *mut VmxRegion,
     pub vmxon_physical: u64,
@@ -70,7 +69,7 @@ pub unsafe fn init_vmxon(vcpu: *mut Vcpu) -> bool {
 }
 
 pub unsafe fn init_vmcs(vcpu: *mut Vcpu) -> bool {
-    let vmcs: *mut VmcsRegion =
+    let vmcs: *mut VmxRegion =
         unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, VMX_REGION_SIZE as u64, VMM_TAG).cast() };
     if vmcs.is_null() {
         log::error!(
@@ -237,41 +236,30 @@ pub unsafe fn vmm_init() -> bool {
     true
 }
 
-pub unsafe fn init_logical_processor(vmm_context: *mut VmmContext, guest_rsp: *mut UNDFND) -> bool {
-    let processor_count = unsafe { (*vmm_context).processor_count };
+pub unsafe fn init_logical_processor(vmm_context: *mut VmmContext) -> bool {
+    let processor_number = unsafe { KeGetCurrentProcessorNumber() };
 
-    let vcpu = unsafe { *(*context).vcpu_table.add(processor_number as usize) };
+    let vcpu = unsafe { *(*vmm_context).vcpu_table.add(processor_number as usize) };
     if vcpu.is_null() {
-        log::error!("vmm.rs: VCPU alloc failed for processor {}", index);
+        log::error!("no vcpu for processor {}", processor_number);
+        return false;
+    }
+
+    if !has_vmx_support() {
+        log::error!("VMX not supported on processor {}", processor_number);
         return false;
     }
 
     if !unsafe { enable_vmx_operation() } {
+        log::error!("enable_vmx_operation failed on processor {}", processor_number);
         return false;
     }
 
-    adjust_control_regs();
-
-    if !(has_vmx_support()) {
-        log::error! {
-            "VMX not supported by this processor. {}", vcpu
-        }
+    if unsafe { x86::bits64::vmx::vmxon((*vcpu).vmxon_physical) }.is_err() {
+        log::error!("VMXON instruction failed on vcpu {:p}", vcpu);
         return false;
     }
 
-    if !(init_vmxon(vcpu)) {
-        log::error! {
-            "VMXON failed to initialize for vcpu {}", vcpu
-        }
-        return false;
-    }
-
-    if unsafe { x86::bits64::vmx::vmxon((*vcpu).vmxon_physical).unwrap() } != 0 {
-        log::error! {
-            "VMX Operation init failed for vcpu {}", vcpu
-        }
-        return false;
-    }
-
+    log::info!("vcpu {:p} in VMX operation on processor {}", vcpu, processor_number);
     true
 }
