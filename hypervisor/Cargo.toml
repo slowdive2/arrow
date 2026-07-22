@@ -7,6 +7,9 @@ edition = "2021"
 [dependencies]
 x86 = "0.52"          # register/MSR access primitives — check latest on crates.io
 bitflags = "2"
+log = "0.4"
+bitfield-struct = "0.8"
+wdk-sys = "0.3" 
 
 [lib]
 crate-type = ["staticlib", "rlib"]
