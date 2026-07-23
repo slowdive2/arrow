@@ -12,6 +12,7 @@ use wdk_sys::{
 
 use x86::msr::{rdmsr, IA32_VMX_BASIC};
 
+use crate::vmcs::GuestRegisters;
 use crate::vmx::{
     adjust_control_regs, enable_vmx_operation, has_vmx_support, VmxRegion, VMX_REGION_SIZE,
 };
@@ -33,6 +34,10 @@ pub struct Vcpu {
 
     pub msr_bitmap: *mut u8,
     pub msr_bitmap_physical: u64,
+    pub guest_registers : GuestRegisters,
+
+    pub guest_descriptor : Descriptors,
+    pub host_descriptor : Descriptors,
 
     pub vmm_context: *mut VmmContext,
 }
@@ -188,6 +193,8 @@ pub unsafe fn init_vcpu() -> *mut Vcpu {
     if !unsafe { init_msr_bitmap(vcpu) } {
         return null_mut();
     }
+    (*vcpu).guest_descriptor = Descriptors::capture_current();
+    (*vcpu).host_descriptor = Descriptors::new_host();
 
     vcpu
 }
