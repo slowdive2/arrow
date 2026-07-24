@@ -12,7 +12,7 @@ use wdk_sys::{
 
 use x86::msr::{rdmsr, IA32_VMX_BASIC};
 
-use crate::vmcs::GuestRegisters;
+use crate::vmcs::{GuestRegisters, capture_registers};
 use crate::vmx::{
     adjust_control_regs, enable_vmx_operation, has_vmx_support, VmxRegion, VMX_REGION_SIZE,
 };
@@ -193,8 +193,6 @@ pub unsafe fn init_vcpu() -> *mut Vcpu {
     if !unsafe { init_msr_bitmap(vcpu) } {
         return null_mut();
     }
-    (*vcpu).guest_descriptor = Descriptors::capture_current();
-    (*vcpu).host_descriptor = Descriptors::new_host();
 
     vcpu
 }
@@ -266,6 +264,10 @@ pub unsafe fn init_logical_processor(vmm_context: *mut VmmContext) -> bool {
         log::error!("VMXON instruction failed on vcpu {:p}", vcpu);
         return false;
     }
+
+    (*vcpu).guest_descriptor = Descriptors::capture_current();
+    (*vcpu).host_descriptor = Descriptors::new_host();
+
 
     log::info!("vcpu {:p} in VMX operation on processor {}", vcpu, processor_number);
     true
