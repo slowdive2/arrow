@@ -304,7 +304,7 @@ pub unsafe fn setup_guest_registers_state(
         vmwrite(vmcs::guest::DS_BASE, 0);
         vmwrite(vmcs::guest::ES_BASE, 0);
 
-        // TODO: read the real FS/GS base MSRs for the current Windows thread.
+        // TODO: read the real FS/GS base MSRs for the current Windows thread
         // Selector-derived bases are not sufficient in long mode.
         vmwrite(vmcs::guest::FS_BASE, 0);
         vmwrite(vmcs::guest::GS_BASE, 0);
@@ -377,7 +377,7 @@ pub unsafe fn setup_host_registers_state(
             host_selector(host_descriptor.tr),
         );
 
-        // TODO: write the real host FS/GS bases used by your Windows context.
+        // TODO: write the real host FS/GS base
         vmwrite(vmcs::host::FS_BASE, 0);
         vmwrite(vmcs::host::GS_BASE, 0);
         vmwrite(vmcs::host::TR_BASE, host_descriptor.tss_base);
@@ -391,7 +391,6 @@ pub unsafe fn setup_host_registers_state(
         vmwrite(vmcs::host::RIP, host_rip);
 
         // TODO: also populate SYSENTER state and any MSR-dependent host fields
-        // enabled by your VM-exit controls (for example IA32_EFER/IA32_PAT).
     }
 }
 
