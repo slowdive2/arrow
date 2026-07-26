@@ -11,6 +11,7 @@ use core::{
 };
 
 use bitfield_struct::bitfield;
+use x86::msr::{rdmsr, IA32_FS_BASE, IA32_GS_BASE};
 use x86::{
     bits64::rflags::RFlags,
     segmentation::{self, SegmentSelector},
@@ -248,16 +249,12 @@ pub fn lsl(selector: SegmentSelector) -> u32 {
 /// Converts the LAR result to the VMCS access-rights encoding.
 #[inline]
 fn vmcs_access_rights(selector: SegmentSelector) -> u64 {
-    u64::from(lar(selector) >> 8)
+    u64::from((lar(selector) >> 8) & !0xF00)
 }
 
 #[inline]
 fn unusable_access_rights() -> u64 {
-    u64::from(
-        SegmentAccessRights::new()
-            .with_unusable(true)
-            .into_bits(),
-    )
+    u64::from(SegmentAccessRights::new().with_unusable(true).into_bits())
 }
 
 #[inline]
@@ -306,8 +303,8 @@ pub unsafe fn setup_guest_registers_state(
 
         // TODO: read the real FS/GS base MSRs for the current Windows thread
         // Selector-derived bases are not sufficient in long mode.
-        vmwrite(vmcs::guest::FS_BASE, 0);
-        vmwrite(vmcs::guest::GS_BASE, 0);
+        vmwrite(vmcs::guest::FS_BASE, rdmsr(IA32_FS_BASE));
+        vmwrite(vmcs::guest::GS_BASE, rdmsr(IA32_GS_BASE));
 
         vmwrite(vmcs::guest::LDTR_BASE, 0);
         vmwrite(vmcs::guest::TR_BASE, guest_descriptor.tss_base);
@@ -319,10 +316,7 @@ pub unsafe fn setup_guest_registers_state(
         vmwrite(vmcs::guest::FS_LIMIT, u64::from(lsl(fs)));
         vmwrite(vmcs::guest::GS_LIMIT, u64::from(lsl(gs)));
         vmwrite(vmcs::guest::LDTR_LIMIT, 0);
-        vmwrite(
-            vmcs::guest::TR_LIMIT,
-            u64::from(guest_descriptor.tss_limit),
-        );
+        vmwrite(vmcs::guest::TR_LIMIT, u64::from(guest_descriptor.tss_limit));
 
         vmwrite(vmcs::guest::CS_ACCESS_RIGHTS, vmcs_access_rights(cs));
         vmwrite(vmcs::guest::SS_ACCESS_RIGHTS, vmcs_access_rights(ss));
@@ -336,11 +330,8 @@ pub unsafe fn setup_guest_registers_state(
             vmcs_access_rights(guest_descriptor.tr),
         );
 
-        vmwrite(
-            vmcs::guest::GDTR_BASE,
-            guest_descriptor.gdtr.base as u64,
-        );
-        vmwrite(vmcs::guest::IDTR_BASE, idtr.base as u64);
+        vmwrite(vmcs::guest::GDTR_BASE, guest_descriptor.gdtr.base as u64);
+        vmwrite(vmcs::guest::IDTR_BASE, guest_descriptor.idtr.base as u64);
         vmwrite(
             vmcs::guest::GDTR_LIMIT,
             u64::from(guest_descriptor.gdtr.limit),
@@ -351,7 +342,6 @@ pub unsafe fn setup_guest_registers_state(
         vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX);
     }
 }
-
 
 pub unsafe fn setup_host_registers_state(
     host_descriptor: &Descriptors,
@@ -372,20 +362,20 @@ pub unsafe fn setup_host_registers_state(
         vmwrite(vmcs::host::ES_SELECTOR, host_selector(segmentation::es()));
         vmwrite(vmcs::host::FS_SELECTOR, host_selector(segmentation::fs()));
         vmwrite(vmcs::host::GS_SELECTOR, host_selector(segmentation::gs()));
-        vmwrite(
-            vmcs::host::TR_SELECTOR,
-            host_selector(host_descriptor.tr),
-        );
+        vmwrite(vmcs::host::TR_SELECTOR, host_selector(host_descriptor.tr));
 
+<<<<<<< HEAD
         // TODO: write the real host FS/GS base
         vmwrite(vmcs::host::FS_BASE, 0);
         vmwrite(vmcs::host::GS_BASE, 0);
+=======
+        // TODO: write the real host FS/GS bases used by your Windows context.
+        vmwrite(vmcs::host::FS_BASE, rdmsr(IA32_FS_BASE));
+        vmwrite(vmcs::host::GS_BASE, rdmsr(IA32_GS_BASE));
+>>>>>>> f3a1e08 (control helper fns)
         vmwrite(vmcs::host::TR_BASE, host_descriptor.tss_base);
-        vmwrite(
-            vmcs::host::GDTR_BASE,
-            host_descriptor.gdtr.base as u64,
-        );
-        vmwrite(vmcs::host::IDTR_BASE, idtr.base as u64);
+        vmwrite(vmcs::host::GDTR_BASE, host_descriptor.gdtr.base as u64);
+        vmwrite(vmcs::host::IDTR_BASE, host_descriptor.idtr.base as u64);
 
         vmwrite(vmcs::host::RSP, host_rsp);
         vmwrite(vmcs::host::RIP, host_rip);
@@ -394,8 +384,59 @@ pub unsafe fn setup_host_registers_state(
     }
 }
 
-pub unsafe fn setup_vmcs_control_fields(_vcpu: &mut Vcpu) {
-    todo!("adjust requested controls through the IA32_VMX_* capability MSRs");
+pub unsafe fn setup_vmcs_control_fields(
+    _vcpu: &mut Vcpu,
+) -> Result<(), VmxError> {
+    let pinbased = unsafe {
+        adjust_pinbased_controls(PINBASED_CTL)
+    };
+
+    let primary = unsafe {
+        adjust_primary_controls(PRIMARY_CTL)
+    };
+
+    let secondary = unsafe {
+        adjust_secondary_controls(SECONDARY_CTL)
+    };
+
+    let entry = unsafe {
+        adjust_entry_controls(ENTRY_CTL)
+    };
+
+    let exit = unsafe {
+        adjust_exit_controls(EXIT_CTL)
+    };
+
+    unsafe {
+        vmwrite(
+            vmcs::control::PINBASED_EXEC_CONTROLS,
+            u64::from(pinbased),
+        )?;
+
+        vmwrite(
+            vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS,
+            u64::from(primary),
+        )?;
+
+        vmwrite(
+            vmcs::control::SECONDARY_PROCBASED_EXEC_CONTROLS,
+            u64::from(secondary),
+        )?;
+
+        vmwrite(
+            vmcs::control::VMENTRY_CONTROLS,
+            u64::from(entry),
+        )?;
+
+        vmwrite(
+            vmcs::control::VMEXIT_CONTROLS,
+            u64::from(exit),
+        )?;
+        vmwrite(vmcs::control::MSR_BITMAPS_ADDR_FULL, msr_bitmap)?;
+    }
+    
+
+    Ok(())
 }
 
 pub unsafe fn setup_vmcs(vcpu: *mut Vcpu) {
@@ -407,10 +448,7 @@ pub unsafe fn setup_vmcs(vcpu: *mut Vcpu) {
         vmclear(vcpu.vmcs_physical);
         vmptrld(vcpu.vmcs_physical);
 
-        setup_guest_registers_state(
-            &vcpu.guest_descriptor,
-            &vcpu.guest_registers,
-        );
+        setup_guest_registers_state(&vcpu.guest_descriptor, &vcpu.guest_registers);
 
         setup_host_registers_state(
             &vcpu.host_descriptor,
