@@ -364,15 +364,8 @@ pub unsafe fn setup_host_registers_state(
         vmwrite(vmcs::host::GS_SELECTOR, host_selector(segmentation::gs()));
         vmwrite(vmcs::host::TR_SELECTOR, host_selector(host_descriptor.tr));
 
-<<<<<<< HEAD
-        // TODO: write the real host FS/GS base
-        vmwrite(vmcs::host::FS_BASE, 0);
-        vmwrite(vmcs::host::GS_BASE, 0);
-=======
-        // TODO: write the real host FS/GS bases used by your Windows context.
         vmwrite(vmcs::host::FS_BASE, rdmsr(IA32_FS_BASE));
         vmwrite(vmcs::host::GS_BASE, rdmsr(IA32_GS_BASE));
->>>>>>> f3a1e08 (control helper fns)
         vmwrite(vmcs::host::TR_BASE, host_descriptor.tss_base);
         vmwrite(vmcs::host::GDTR_BASE, host_descriptor.gdtr.base as u64);
         vmwrite(vmcs::host::IDTR_BASE, host_descriptor.idtr.base as u64);
@@ -395,8 +388,11 @@ pub unsafe fn setup_vmcs_control_fields(
         adjust_primary_controls(PRIMARY_CTL)
     };
 
-    let secondary = unsafe {
+    // #GP if bit not set
+    let secondary = if primary & (1 << 31) != 0 {
         adjust_secondary_controls(SECONDARY_CTL)
+    } else {
+        0
     };
 
     let entry = unsafe {
@@ -433,6 +429,8 @@ pub unsafe fn setup_vmcs_control_fields(
             u64::from(exit),
         )?;
         vmwrite(vmcs::control::MSR_BITMAPS_ADDR_FULL, msr_bitmap)?;
+        vmwrite(vmcs::control::CR0_READ_SHADOW, x86::controlregs::cr0().bits() as u64);
+        vmwrite(vmcs::control::CR4_READ_SHADOW, x86::controlregs::cr4().bits() as u64);
     }
     
 
