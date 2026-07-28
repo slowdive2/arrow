@@ -12,7 +12,11 @@ use wdk_sys::{
 
 use x86::msr::{rdmsr, IA32_VMX_BASIC};
 
-use crate::vmcs::{capture_registers, GuestRegisters};
+use crate::descriptor::Descriptors;
+use crate::support::vmxoff;
+use crate::vmcs::{capture_registers, setup_vmcs, GuestRegisters};
+use crate::vmexit;
+use crate::vmlaunch::launch_vm;
 use crate::vmx::{
     adjust_control_regs, enable_vmx_operation, has_vmx_support, VmxRegion, VMX_REGION_SIZE,
 };
@@ -269,12 +273,23 @@ pub unsafe fn init_logical_processor(vmm_context: *mut VmmContext) -> bool {
     }
 
     (*vcpu).guest_descriptor = Descriptors::capture_current();
-    (*vcpu).host_descriptor = Descriptors::new_host();
+    // No separate host address space yet: host state mirrors the live one.
+    (*vcpu).host_descriptor = Descriptors::capture_current();
 
     log::info!(
         "vcpu {:p} in VMX operation on processor {}",
         vcpu,
         processor_number
     );
-    true
+
+    unsafe { capture_registers(&mut (*vcpu).guest_registers) };
+
+    if !unsafe { setup_vmcs(vcpu) } {
+        log::error!("setup_vmcs failed on processor {}", processor_number);
+        vmxoff();
+        return false;
+    }
+
+    let rflags = unsafe { launch_vm(&mut (*vcpu).guest_registers, 0) };
+    vmexit::handle_vmexit(rflags)
 }

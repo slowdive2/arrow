@@ -248,8 +248,10 @@ name = "driver"
 version = "0.1.0"
 dependencies = [
  "hypervisor",
+ "log",
  "wdk",
  "wdk-alloc",
+ "wdk-build",
  "wdk-panic",
  "wdk-sys",
 ]

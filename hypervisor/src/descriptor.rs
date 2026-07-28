@@ -3,7 +3,6 @@ use x86::{
     segmentation::SegmentSelector,
 };
 
-#[derive(Default, Copy, Clone)]
 pub struct Descriptors {
     pub gdtr: DescriptorTablePointer<u64>,
     pub idtr: DescriptorTablePointer<u64>,
@@ -47,7 +46,7 @@ unsafe fn resolve_tss_descriptor(gdt_base: *const u64, tr: SegmentSelector) -> (
     // tss descriptor in long mode is 16 bytes (2 GDT slots)
     // base = 63:56 of high | 39:16 of low
     // limit = 19:16 of high | 15:0 of low
-    // Access rights derived from low bits 47:40 + G bit + AVL
+    // access rights derived from low bits 47:40 + G bit + AVL
     let index = tr.index() as usize;
     let low  = unsafe { *gdt_base.add(index) };
     let high = unsafe { *gdt_base.add(index + 1) };
@@ -60,7 +59,7 @@ unsafe fn resolve_tss_descriptor(gdt_base: *const u64, tr: SegmentSelector) -> (
     let limit_high = ((low >> 48) & 0xf) as u32;
     let limit = limit_low | (limit_high << 16);
 
-    let ar_native = ((low >> 40) & 0xff) as u32 | (((low >> 52) & 0xf) << 12);
+    let ar_native = (((low >> 40) & 0xff) as u32) | ((((low >> 52) & 0xf) as u32) << 12);
 
     (base, limit, ar_native)
 }

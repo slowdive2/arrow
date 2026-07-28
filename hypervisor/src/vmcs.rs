@@ -12,16 +12,20 @@ use core::{
 
 use bitfield_struct::bitfield;
 use x86::msr::{rdmsr, IA32_FS_BASE, IA32_GS_BASE};
+use x86::vmx::vmcs::{self, control::{EntryControls, ExitControls}};
 use x86::{
     bits64::rflags::RFlags,
     segmentation::{self, SegmentSelector},
 };
 
 use crate::{
-    descriptors::Descriptors,
-    vcpu::Vcpu,
-    vmcs,
-    vmx::{vmclear, vmptrld, vmwrite},
+    descriptor::Descriptors,
+    support::{vmclear, vmptrld, vmwrite},
+    vmm::Vcpu,
+    vmx::{
+        adjust_entry_controls, adjust_exit_controls, adjust_pinbased_controls,
+        adjust_primary_controls, adjust_secondary_controls,
+    },
 };
 
 #[repr(C, align(16))]
@@ -196,7 +200,8 @@ capture_registers:
     registers_xmm15 = const mem::offset_of!(GuestRegisters, xmm15),
 );
 
-/// Executes LAR and returns its architecturally formatted result.
+/// executes LAR and returns its architecturally formatted result
+/// zf iff successful
 pub fn lar(selector: SegmentSelector) -> u32 {
     let access_rights: u64;
     let flags: u64;
@@ -221,7 +226,7 @@ pub fn lar(selector: SegmentSelector) -> u32 {
     access_rights as u32
 }
 
-/// Executes LSL and returns the segment limit.
+/// executes LSL and returns the segment limit
 pub fn lsl(selector: SegmentSelector) -> u32 {
     let limit: u64;
     let flags: u64;
@@ -246,7 +251,7 @@ pub fn lsl(selector: SegmentSelector) -> u32 {
     limit as u32
 }
 
-/// Converts the LAR result to the VMCS access-rights encoding.
+/// converts the LAR result to the VMCS access-rights encoding
 #[inline]
 fn vmcs_access_rights(selector: SegmentSelector) -> u64 {
     u64::from((lar(selector) >> 8) & !0xF00)
@@ -259,7 +264,6 @@ fn unusable_access_rights() -> u64 {
 
 #[inline]
 fn host_selector(selector: SegmentSelector) -> u64 {
-    // VM-entry validation requires RPL and TI to be zero in host selectors.
     u64::from(selector.bits() & !0x7)
 }
 pub unsafe fn setup_guest_registers_state(
@@ -289,24 +293,22 @@ pub unsafe fn setup_guest_registers_state(
         vmwrite(vmcs::guest::ES_SELECTOR, u64::from(es.bits()));
         vmwrite(vmcs::guest::FS_SELECTOR, u64::from(fs.bits()));
         vmwrite(vmcs::guest::GS_SELECTOR, u64::from(gs.bits()));
-        vmwrite(vmcs::guest::LDTR_SELECTOR, 0);
+        vmwrite(vmcs::guest::LDTR_SELECTOR, 0u64);
         vmwrite(
             vmcs::guest::TR_SELECTOR,
             u64::from(guest_descriptor.tr.bits()),
         );
 
-        // In 64-bit mode, CS/SS/DS/ES bases are architecturally zero.
-        vmwrite(vmcs::guest::CS_BASE, 0);
-        vmwrite(vmcs::guest::SS_BASE, 0);
-        vmwrite(vmcs::guest::DS_BASE, 0);
-        vmwrite(vmcs::guest::ES_BASE, 0);
+        vmwrite(vmcs::guest::CS_BASE, 0u64);
+        vmwrite(vmcs::guest::SS_BASE, 0u64);
+        vmwrite(vmcs::guest::DS_BASE, 0u64);
+        vmwrite(vmcs::guest::ES_BASE, 0u64);
 
-        // TODO: read the real FS/GS base MSRs for the current Windows thread
-        // Selector-derived bases are not sufficient in long mode.
+        // we in long mode !
         vmwrite(vmcs::guest::FS_BASE, rdmsr(IA32_FS_BASE));
         vmwrite(vmcs::guest::GS_BASE, rdmsr(IA32_GS_BASE));
 
-        vmwrite(vmcs::guest::LDTR_BASE, 0);
+        vmwrite(vmcs::guest::LDTR_BASE, 0u64);
         vmwrite(vmcs::guest::TR_BASE, guest_descriptor.tss_base);
 
         vmwrite(vmcs::guest::CS_LIMIT, u64::from(lsl(cs)));
@@ -315,7 +317,7 @@ pub unsafe fn setup_guest_registers_state(
         vmwrite(vmcs::guest::ES_LIMIT, u64::from(lsl(es)));
         vmwrite(vmcs::guest::FS_LIMIT, u64::from(lsl(fs)));
         vmwrite(vmcs::guest::GS_LIMIT, u64::from(lsl(gs)));
-        vmwrite(vmcs::guest::LDTR_LIMIT, 0);
+        vmwrite(vmcs::guest::LDTR_LIMIT, 0u64);
         vmwrite(vmcs::guest::TR_LIMIT, u64::from(guest_descriptor.tss_limit));
 
         vmwrite(vmcs::guest::CS_ACCESS_RIGHTS, vmcs_access_rights(cs));
@@ -336,9 +338,9 @@ pub unsafe fn setup_guest_registers_state(
             vmcs::guest::GDTR_LIMIT,
             u64::from(guest_descriptor.gdtr.limit),
         );
-        vmwrite(vmcs::guest::IDTR_LIMIT, u64::from(idtr.limit));
+        vmwrite(vmcs::guest::IDTR_LIMIT, u64::from(guest_descriptor.idtr.limit));
 
-        // No shadow VMCS is linked.
+        // no shadow VMCS is linked
         vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX);
     }
 }
@@ -349,8 +351,6 @@ pub unsafe fn setup_host_registers_state(
     host_rsp: u64,
     host_rip: u64,
 ) {
-    let idtr = x86::dtables::sidt();
-
     unsafe {
         vmwrite(vmcs::host::CR0, x86::controlregs::cr0().bits() as u64);
         vmwrite(vmcs::host::CR3, host_cr3);
@@ -373,71 +373,74 @@ pub unsafe fn setup_host_registers_state(
         vmwrite(vmcs::host::RSP, host_rsp);
         vmwrite(vmcs::host::RIP, host_rip);
 
-        // TODO: also populate SYSENTER state and any MSR-dependent host fields
     }
 }
 
-pub unsafe fn setup_vmcs_control_fields(
-    _vcpu: &mut Vcpu,
-) -> Result<(), VmxError> {
-    let pinbased = unsafe {
-        adjust_pinbased_controls(PINBASED_CTL)
-    };
+const PINBASED_CTL: u32 = 0;
+const PRIMARY_CTL: u32 = 0;
+const SECONDARY_CTL: u32 = 0;
+// guest and host are both running in 64-bit mode here, so both must be forced on
+const ENTRY_CTL: u32 = EntryControls::IA32E_MODE_GUEST.bits();
+const EXIT_CTL: u32 = ExitControls::HOST_ADDRESS_SPACE_SIZE.bits();
 
-    let primary = unsafe {
-        adjust_primary_controls(PRIMARY_CTL)
-    };
+pub unsafe fn setup_vmcs_control_fields(vcpu: &mut Vcpu) -> bool {
+    let pinbased = unsafe { adjust_pinbased_controls(PINBASED_CTL) };
+    let primary = unsafe { adjust_primary_controls(PRIMARY_CTL) };
 
-    // #GP if bit not set
+    // IA32_VMX_PROCBASED_CTLS2 iff bit 31 is set
     let secondary = if primary & (1 << 31) != 0 {
-        adjust_secondary_controls(SECONDARY_CTL)
+        unsafe { adjust_secondary_controls(SECONDARY_CTL) }
     } else {
         0
     };
 
-    let entry = unsafe {
-        adjust_entry_controls(ENTRY_CTL)
-    };
+    let entry = unsafe { adjust_entry_controls(ENTRY_CTL) };
+    let exit = unsafe { adjust_exit_controls(EXIT_CTL) };
 
-    let exit = unsafe {
-        adjust_exit_controls(EXIT_CTL)
-    };
+    if entry & ENTRY_CTL != ENTRY_CTL || exit & EXIT_CTL != EXIT_CTL {
+        log::error!("required VM-entry/VM-exit controls unavailable on this CPU");
+        return false;
+    }
 
     unsafe {
-        vmwrite(
-            vmcs::control::PINBASED_EXEC_CONTROLS,
-            u64::from(pinbased),
-        )?;
-
+        vmwrite(vmcs::control::PINBASED_EXEC_CONTROLS, u64::from(pinbased));
         vmwrite(
             vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS,
             u64::from(primary),
-        )?;
-
+        );
         vmwrite(
             vmcs::control::SECONDARY_PROCBASED_EXEC_CONTROLS,
             u64::from(secondary),
-        )?;
+        );
+        vmwrite(vmcs::control::VMENTRY_CONTROLS, u64::from(entry));
+        vmwrite(vmcs::control::VMEXIT_CONTROLS, u64::from(exit));
+        vmwrite(vmcs::control::MSR_BITMAPS_ADDR_FULL, vcpu.msr_bitmap_physical);
 
+        vmwrite(vmcs::control::CR0_GUEST_HOST_MASK, 0u64);
+        vmwrite(vmcs::control::CR4_GUEST_HOST_MASK, 0u64);
         vmwrite(
-            vmcs::control::VMENTRY_CONTROLS,
-            u64::from(entry),
-        )?;
+            vmcs::control::CR0_READ_SHADOW,
+            x86::controlregs::cr0().bits() as u64,
+        );
+        vmwrite(
+            vmcs::control::CR4_READ_SHADOW,
+            x86::controlregs::cr4().bits() as u64,
+        );
 
-        vmwrite(
-            vmcs::control::VMEXIT_CONTROLS,
-            u64::from(exit),
-        )?;
-        vmwrite(vmcs::control::MSR_BITMAPS_ADDR_FULL, msr_bitmap)?;
-        vmwrite(vmcs::control::CR0_READ_SHADOW, x86::controlregs::cr0().bits() as u64);
-        vmwrite(vmcs::control::CR4_READ_SHADOW, x86::controlregs::cr4().bits() as u64);
+        vmwrite(vmcs::control::EXCEPTION_BITMAP, 0u64);
+        vmwrite(vmcs::control::PAGE_FAULT_ERR_CODE_MASK, 0u64);
+        vmwrite(vmcs::control::PAGE_FAULT_ERR_CODE_MATCH, 0u64);
+        vmwrite(vmcs::control::CR3_TARGET_COUNT, 0u64);
+        vmwrite(vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD, 0u64);
+        vmwrite(vmcs::control::VMENTRY_MSR_LOAD_COUNT, 0u64);
+        vmwrite(vmcs::control::VMEXIT_MSR_STORE_COUNT, 0u64);
+        vmwrite(vmcs::control::VMEXIT_MSR_LOAD_COUNT, 0u64);
     }
-    
 
-    Ok(())
+    true
 }
 
-pub unsafe fn setup_vmcs(vcpu: *mut Vcpu) {
+pub unsafe fn setup_vmcs(vcpu: *mut Vcpu) -> bool {
     assert!(!vcpu.is_null(), "setup_vmcs received a null Vcpu pointer");
 
     let vcpu = unsafe { &mut *vcpu };
@@ -448,13 +451,10 @@ pub unsafe fn setup_vmcs(vcpu: *mut Vcpu) {
 
         setup_guest_registers_state(&vcpu.guest_descriptor, &vcpu.guest_registers);
 
-        setup_host_registers_state(
-            &vcpu.host_descriptor,
-            x86::controlregs::cr3(),
-            vcpu.host_stack_top,
-            vcpu.vmexit_entry,
-        );
+        // launch_vm (vmlaunch.rs) overwrites HOST_RSP/HOST_RIP itself right
+        // before executing vmlaunch anyways :C
+        setup_host_registers_state(&vcpu.host_descriptor, x86::controlregs::cr3(), 0, 0);
 
-        setup_vmcs_control_fields(vcpu);
+        setup_vmcs_control_fields(vcpu)
     }
 }

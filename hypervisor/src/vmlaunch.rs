@@ -20,7 +20,7 @@
 // https://github.com/memN0ps/illusion-rs/blob/main/hypervisor/src/intel/vmlaunch.rs
 
 use {
-    crate::intel::capture::GuestRegisters,
+    crate::vmcs::GuestRegisters,
     core::{arch::global_asm, mem},
 };
 
