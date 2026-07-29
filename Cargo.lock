@@ -303,6 +303,7 @@ dependencies = [
 name = "hypervisor"
 version = "0.1.0"
 dependencies = [
+ "bit_field",
  "bitfield-struct",
  "bitflags 2.13.1",
  "log",

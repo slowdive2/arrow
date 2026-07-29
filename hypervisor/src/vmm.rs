@@ -13,9 +13,9 @@ use wdk_sys::{
 use x86::msr::{rdmsr, IA32_VMX_BASIC};
 
 use crate::descriptor::Descriptors;
+use crate::exit::vmexit::{handle_vmexit, VmExitAction};
 use crate::support::vmxoff;
 use crate::vmcs::{capture_registers, setup_vmcs, GuestRegisters};
-use crate::vmexit;
 use crate::vmlaunch::launch_vm;
 use crate::vmx::{
     adjust_control_regs, enable_vmx_operation, has_vmx_support, VmxRegion, VMX_REGION_SIZE,
@@ -273,7 +273,7 @@ pub unsafe fn init_logical_processor(vmm_context: *mut VmmContext) -> bool {
     }
 
     (*vcpu).guest_descriptor = Descriptors::capture_current();
-    // No separate host address space yet: host state mirrors the live one.
+    // no separate host address space yet
     (*vcpu).host_descriptor = Descriptors::capture_current();
 
     log::info!(
@@ -290,6 +290,15 @@ pub unsafe fn init_logical_processor(vmm_context: *mut VmmContext) -> bool {
         return false;
     }
 
-    let rflags = unsafe { launch_vm(&mut (*vcpu).guest_registers, 0) };
-    vmexit::handle_vmexit(rflags)
+    let mut launched = 0u64;
+    loop {
+        let rflags = unsafe { launch_vm(&mut (*vcpu).guest_registers, launched) };
+
+        if unsafe { handle_vmexit(rflags, &mut *vcpu) } == VmExitAction::Shutdown {
+            vmxoff();
+            return true;
+        }
+
+        launched = 1;
+    }
 }
