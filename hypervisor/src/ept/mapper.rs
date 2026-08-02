@@ -19,44 +19,25 @@ unsafe fn phys_of(ptr: *mut c_void) -> u64 {
     unsafe { MmGetPhysicalAddress(ptr).QuadPart as u64 }
 }
 
+#[inline]
+unsafe fn free_if_non_null<T>(ptr: *mut T) {
+    if !ptr.is_null() {
+        unsafe { ExFreePoolWithTag(ptr.cast(), EPT_TAG) };
+    }
+}
+
 pub unsafe fn initialize_ept() -> u64 {
     PAGED_CODE!();
 
     // pool2 zeroes these pages for us
     let ept_pml4: *mut EptPageMapLevel4 =
         unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, EPT_PAGE_SIZE as u64, EPT_TAG).cast() };
-    if ept_pml4.is_null() {
-        return 0;
-    }
-
     let ept_pdpt: *mut EptPageDirectoryPointerTable =
         unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, EPT_PAGE_SIZE as u64, EPT_TAG).cast() };
-    if ept_pdpt.is_null() {
-        unsafe { ExFreePoolWithTag(ept_pml4.cast(), EPT_TAG) };
-        return 0;
-    }
-
     let ept_pd: *mut EptPageDirectory =
         unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, EPT_PAGE_SIZE as u64, EPT_TAG).cast() };
-    if ept_pd.is_null() {
-        unsafe {
-            ExFreePoolWithTag(ept_pdpt.cast(), EPT_TAG);
-            ExFreePoolWithTag(ept_pml4.cast(), EPT_TAG);
-        }
-        return 0;
-    }
-
     let ept_pt: *mut EptPageTable =
         unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, EPT_PAGE_SIZE as u64, EPT_TAG).cast() };
-    if ept_pt.is_null() {
-        unsafe {
-            ExFreePoolWithTag(ept_pd.cast(), EPT_TAG);
-            ExFreePoolWithTag(ept_pdpt.cast(), EPT_TAG);
-            ExFreePoolWithTag(ept_pml4.cast(), EPT_TAG);
-        }
-        return 0;
-    }
-
     let guest_memory: *mut u8 = unsafe {
         ExAllocatePool2(
             POOL_FLAG_NON_PAGED,
@@ -65,12 +46,19 @@ pub unsafe fn initialize_ept() -> u64 {
         )
         .cast()
     };
-    if guest_memory.is_null() {
+
+    if ept_pml4.is_null()
+        || ept_pdpt.is_null()
+        || ept_pd.is_null()
+        || ept_pt.is_null()
+        || guest_memory.is_null()
+    {
         unsafe {
-            ExFreePoolWithTag(ept_pt.cast(), EPT_TAG);
-            ExFreePoolWithTag(ept_pd.cast(), EPT_TAG);
-            ExFreePoolWithTag(ept_pdpt.cast(), EPT_TAG);
-            ExFreePoolWithTag(ept_pml4.cast(), EPT_TAG);
+            free_if_non_null(guest_memory);
+            free_if_non_null(ept_pt);
+            free_if_non_null(ept_pd);
+            free_if_non_null(ept_pdpt);
+            free_if_non_null(ept_pml4);
         }
         return 0;
     }
@@ -133,10 +121,15 @@ pub unsafe fn initialize_ept() -> u64 {
 
     // eptp setup
     let ept_pml4_phys = unsafe { phys_of(ept_pml4.cast()) };
-    EptPointer::new()
+
+    let ept_ptr = EptPointer::new()
         .with_memory_type(EptPagingStructureMemoryType::WriteBack as u8)
         .with_page_walk_length_minus_one(EPT_FOUR_LEVEL_WALK_LENGTH)
         .with_accessed_and_dirty_enabled(true)
         .with_pml4_page_number(ept_pml4_phys >> EPT_PAGE_SHIFT)
-        .into_bits()
+        .into_bits();
+
+    log::debug!("EPT pointer allocated at {ept_ptr:#x}");
+
+    ept_ptr
 }
