@@ -1,9 +1,5 @@
-//! VMCS guest/host register-state setup.
-//!
-//! The `GuestRegisters` layout and capture-then-launch pattern are derived from
-//! illusion-rs (Copyright © memN0ps), used under the MIT License.
-//! Original: https://github.com/memN0ps/illusion-rs
-//!
+// guest register layout follows illusion-rs
+// https://github.com/memN0ps/illusion-rs
 
 use core::{
     arch::{asm, global_asm},
@@ -12,7 +8,10 @@ use core::{
 
 use bitfield_struct::bitfield;
 use x86::msr::{rdmsr, IA32_FS_BASE, IA32_GS_BASE};
-use x86::vmx::vmcs::{self, control::{EntryControls, ExitControls}};
+use x86::vmx::vmcs::{
+    self,
+    control::{EntryControls, ExitControls, PrimaryControls, SecondaryControls},
+};
 use x86::{
     bits64::rflags::RFlags,
     segmentation::{self, SegmentSelector},
@@ -36,13 +35,13 @@ pub struct M128A {
 }
 
 unsafe extern "win64" {
-    pub fn capture_registers(registers: &mut GuestRegisters) -> bool;
+    pub fn capture_registers(registers: &mut GuestRegs) -> bool;
 }
 
-/// Intel VMCS segment access-rights field.
+// vmcs segment access rights
 #[bitfield(u32)]
 #[derive(PartialEq, Eq)]
-pub struct SegmentAccessRights {
+pub struct SegAccess {
     #[bits(4)]
     pub segment_type: u8,
     pub s: bool,
@@ -62,7 +61,7 @@ pub struct SegmentAccessRights {
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default)]
-pub struct GuestRegisters {
+pub struct GuestRegs {
     pub rax: u64,
     pub rcx: u64,
     pub rdx: u64,
@@ -97,21 +96,14 @@ pub struct GuestRegisters {
     pub xmm13: M128A,
     pub xmm14: M128A,
     pub xmm15: M128A,
-    pub original_lstar: u64,
+    pub orig_lstar: u64,
     pub hook_lstar: u64,
 }
 
 global_asm!(
     r#"
-.intel_syntax noprefix
 
-// Captures the current GPRs, RFLAGS, caller RSP/RIP, and XMM registers.
-//
-// Windows x64 ABI:
-//     RCX = &mut GuestRegisters
-//
-// Consequently, the saved RCX value is the argument pointer rather than the
-// caller's pre-call RCX. The launch/resume design must account for that.
+// rcx holds the output ptr, so the original rcx is already gone
 .global capture_registers
 capture_registers:
     mov     [rcx + {registers_rax}], rax
@@ -135,11 +127,11 @@ capture_registers:
     pop     rax
     mov     [rcx + {registers_rflags}], rax
 
-    // Save the caller's stack pointer, not this function's entry RSP.
+    // caller rsp
     lea     rax, [rsp + 8]
     mov     [rcx + {registers_rsp}], rax
 
-    // The return address is the caller continuation RIP.
+    // caller rip
     mov     rax, [rsp]
     mov     [rcx + {registers_rip}], rax
 
@@ -160,48 +152,47 @@ capture_registers:
     movaps  [rcx + {registers_xmm14}], xmm14
     movaps  [rcx + {registers_xmm15}], xmm15
 
-    // false: execution has not yet resumed through the virtualized path.
+    // first pass returns false
     xor     eax, eax
     ret
 "#,
-    registers_rax = const mem::offset_of!(GuestRegisters, rax),
-    registers_rcx = const mem::offset_of!(GuestRegisters, rcx),
-    registers_rdx = const mem::offset_of!(GuestRegisters, rdx),
-    registers_rbx = const mem::offset_of!(GuestRegisters, rbx),
-    registers_rsp = const mem::offset_of!(GuestRegisters, rsp),
-    registers_rbp = const mem::offset_of!(GuestRegisters, rbp),
-    registers_rsi = const mem::offset_of!(GuestRegisters, rsi),
-    registers_rdi = const mem::offset_of!(GuestRegisters, rdi),
-    registers_r8 = const mem::offset_of!(GuestRegisters, r8),
-    registers_r9 = const mem::offset_of!(GuestRegisters, r9),
-    registers_r10 = const mem::offset_of!(GuestRegisters, r10),
-    registers_r11 = const mem::offset_of!(GuestRegisters, r11),
-    registers_r12 = const mem::offset_of!(GuestRegisters, r12),
-    registers_r13 = const mem::offset_of!(GuestRegisters, r13),
-    registers_r14 = const mem::offset_of!(GuestRegisters, r14),
-    registers_r15 = const mem::offset_of!(GuestRegisters, r15),
-    registers_rip = const mem::offset_of!(GuestRegisters, rip),
-    registers_rflags = const mem::offset_of!(GuestRegisters, rflags),
-    registers_xmm0 = const mem::offset_of!(GuestRegisters, xmm0),
-    registers_xmm1 = const mem::offset_of!(GuestRegisters, xmm1),
-    registers_xmm2 = const mem::offset_of!(GuestRegisters, xmm2),
-    registers_xmm3 = const mem::offset_of!(GuestRegisters, xmm3),
-    registers_xmm4 = const mem::offset_of!(GuestRegisters, xmm4),
-    registers_xmm5 = const mem::offset_of!(GuestRegisters, xmm5),
-    registers_xmm6 = const mem::offset_of!(GuestRegisters, xmm6),
-    registers_xmm7 = const mem::offset_of!(GuestRegisters, xmm7),
-    registers_xmm8 = const mem::offset_of!(GuestRegisters, xmm8),
-    registers_xmm9 = const mem::offset_of!(GuestRegisters, xmm9),
-    registers_xmm10 = const mem::offset_of!(GuestRegisters, xmm10),
-    registers_xmm11 = const mem::offset_of!(GuestRegisters, xmm11),
-    registers_xmm12 = const mem::offset_of!(GuestRegisters, xmm12),
-    registers_xmm13 = const mem::offset_of!(GuestRegisters, xmm13),
-    registers_xmm14 = const mem::offset_of!(GuestRegisters, xmm14),
-    registers_xmm15 = const mem::offset_of!(GuestRegisters, xmm15),
+    registers_rax = const mem::offset_of!(GuestRegs, rax),
+    registers_rcx = const mem::offset_of!(GuestRegs, rcx),
+    registers_rdx = const mem::offset_of!(GuestRegs, rdx),
+    registers_rbx = const mem::offset_of!(GuestRegs, rbx),
+    registers_rsp = const mem::offset_of!(GuestRegs, rsp),
+    registers_rbp = const mem::offset_of!(GuestRegs, rbp),
+    registers_rsi = const mem::offset_of!(GuestRegs, rsi),
+    registers_rdi = const mem::offset_of!(GuestRegs, rdi),
+    registers_r8 = const mem::offset_of!(GuestRegs, r8),
+    registers_r9 = const mem::offset_of!(GuestRegs, r9),
+    registers_r10 = const mem::offset_of!(GuestRegs, r10),
+    registers_r11 = const mem::offset_of!(GuestRegs, r11),
+    registers_r12 = const mem::offset_of!(GuestRegs, r12),
+    registers_r13 = const mem::offset_of!(GuestRegs, r13),
+    registers_r14 = const mem::offset_of!(GuestRegs, r14),
+    registers_r15 = const mem::offset_of!(GuestRegs, r15),
+    registers_rip = const mem::offset_of!(GuestRegs, rip),
+    registers_rflags = const mem::offset_of!(GuestRegs, rflags),
+    registers_xmm0 = const mem::offset_of!(GuestRegs, xmm0),
+    registers_xmm1 = const mem::offset_of!(GuestRegs, xmm1),
+    registers_xmm2 = const mem::offset_of!(GuestRegs, xmm2),
+    registers_xmm3 = const mem::offset_of!(GuestRegs, xmm3),
+    registers_xmm4 = const mem::offset_of!(GuestRegs, xmm4),
+    registers_xmm5 = const mem::offset_of!(GuestRegs, xmm5),
+    registers_xmm6 = const mem::offset_of!(GuestRegs, xmm6),
+    registers_xmm7 = const mem::offset_of!(GuestRegs, xmm7),
+    registers_xmm8 = const mem::offset_of!(GuestRegs, xmm8),
+    registers_xmm9 = const mem::offset_of!(GuestRegs, xmm9),
+    registers_xmm10 = const mem::offset_of!(GuestRegs, xmm10),
+    registers_xmm11 = const mem::offset_of!(GuestRegs, xmm11),
+    registers_xmm12 = const mem::offset_of!(GuestRegs, xmm12),
+    registers_xmm13 = const mem::offset_of!(GuestRegs, xmm13),
+    registers_xmm14 = const mem::offset_of!(GuestRegs, xmm14),
+    registers_xmm15 = const mem::offset_of!(GuestRegs, xmm15),
 );
 
-/// executes LAR and returns its architecturally formatted result
-/// zf iff successful
+// read access rights with lar
 pub fn lar(selector: SegmentSelector) -> u32 {
     let access_rights: u64;
     let flags: u64;
@@ -226,7 +217,7 @@ pub fn lar(selector: SegmentSelector) -> u32 {
     access_rights as u32
 }
 
-/// executes LSL and returns the segment limit
+// read a segment limit
 pub fn lsl(selector: SegmentSelector) -> u32 {
     let limit: u64;
     let flags: u64;
@@ -251,7 +242,7 @@ pub fn lsl(selector: SegmentSelector) -> u32 {
     limit as u32
 }
 
-/// converts the LAR result to the VMCS access-rights encoding
+// lar and vmcs store these bits differently
 #[inline]
 fn vmcs_access_rights(selector: SegmentSelector) -> u64 {
     u64::from((lar(selector) >> 8) & !0xF00)
@@ -259,17 +250,14 @@ fn vmcs_access_rights(selector: SegmentSelector) -> u64 {
 
 #[inline]
 fn unusable_access_rights() -> u64 {
-    u64::from(SegmentAccessRights::new().with_unusable(true).into_bits())
+    u64::from(SegAccess::new().with_unusable(true).into_bits())
 }
 
 #[inline]
 fn host_selector(selector: SegmentSelector) -> u64 {
     u64::from(selector.bits() & !0x7)
 }
-pub unsafe fn setup_guest_registers_state(
-    guest_descriptor: &Descriptors,
-    guest_registers: &GuestRegisters,
-) {
+pub unsafe fn setup_guest_state(guest_desc: &Descriptors, regs: &GuestRegs) {
     let cs = segmentation::cs();
     let ss = segmentation::ss();
     let ds = segmentation::ds();
@@ -283,9 +271,9 @@ pub unsafe fn setup_guest_registers_state(
         vmwrite(vmcs::guest::CR4, x86::controlregs::cr4().bits() as u64);
         vmwrite(vmcs::guest::DR7, x86::debugregs::dr7().0 as u64);
 
-        vmwrite(vmcs::guest::RSP, guest_registers.rsp);
-        vmwrite(vmcs::guest::RIP, guest_registers.rip);
-        vmwrite(vmcs::guest::RFLAGS, guest_registers.rflags);
+        vmwrite(vmcs::guest::RSP, regs.rsp);
+        vmwrite(vmcs::guest::RIP, regs.rip);
+        vmwrite(vmcs::guest::RFLAGS, regs.rflags);
 
         vmwrite(vmcs::guest::CS_SELECTOR, u64::from(cs.bits()));
         vmwrite(vmcs::guest::SS_SELECTOR, u64::from(ss.bits()));
@@ -294,22 +282,19 @@ pub unsafe fn setup_guest_registers_state(
         vmwrite(vmcs::guest::FS_SELECTOR, u64::from(fs.bits()));
         vmwrite(vmcs::guest::GS_SELECTOR, u64::from(gs.bits()));
         vmwrite(vmcs::guest::LDTR_SELECTOR, 0u64);
-        vmwrite(
-            vmcs::guest::TR_SELECTOR,
-            u64::from(guest_descriptor.tr.bits()),
-        );
+        vmwrite(vmcs::guest::TR_SELECTOR, u64::from(guest_desc.tr.bits()));
 
         vmwrite(vmcs::guest::CS_BASE, 0u64);
         vmwrite(vmcs::guest::SS_BASE, 0u64);
         vmwrite(vmcs::guest::DS_BASE, 0u64);
         vmwrite(vmcs::guest::ES_BASE, 0u64);
 
-        // we in long mode !
+        // long mode
         vmwrite(vmcs::guest::FS_BASE, rdmsr(IA32_FS_BASE));
         vmwrite(vmcs::guest::GS_BASE, rdmsr(IA32_GS_BASE));
 
         vmwrite(vmcs::guest::LDTR_BASE, 0u64);
-        vmwrite(vmcs::guest::TR_BASE, guest_descriptor.tss_base);
+        vmwrite(vmcs::guest::TR_BASE, guest_desc.tss_base);
 
         vmwrite(vmcs::guest::CS_LIMIT, u64::from(lsl(cs)));
         vmwrite(vmcs::guest::SS_LIMIT, u64::from(lsl(ss)));
@@ -318,7 +303,7 @@ pub unsafe fn setup_guest_registers_state(
         vmwrite(vmcs::guest::FS_LIMIT, u64::from(lsl(fs)));
         vmwrite(vmcs::guest::GS_LIMIT, u64::from(lsl(gs)));
         vmwrite(vmcs::guest::LDTR_LIMIT, 0u64);
-        vmwrite(vmcs::guest::TR_LIMIT, u64::from(guest_descriptor.tss_limit));
+        vmwrite(vmcs::guest::TR_LIMIT, u64::from(guest_desc.tss_limit));
 
         vmwrite(vmcs::guest::CS_ACCESS_RIGHTS, vmcs_access_rights(cs));
         vmwrite(vmcs::guest::SS_ACCESS_RIGHTS, vmcs_access_rights(ss));
@@ -329,24 +314,21 @@ pub unsafe fn setup_guest_registers_state(
         vmwrite(vmcs::guest::LDTR_ACCESS_RIGHTS, unusable_access_rights());
         vmwrite(
             vmcs::guest::TR_ACCESS_RIGHTS,
-            vmcs_access_rights(guest_descriptor.tr),
+            vmcs_access_rights(guest_desc.tr),
         );
 
-        vmwrite(vmcs::guest::GDTR_BASE, guest_descriptor.gdtr.base as u64);
-        vmwrite(vmcs::guest::IDTR_BASE, guest_descriptor.idtr.base as u64);
-        vmwrite(
-            vmcs::guest::GDTR_LIMIT,
-            u64::from(guest_descriptor.gdtr.limit),
-        );
-        vmwrite(vmcs::guest::IDTR_LIMIT, u64::from(guest_descriptor.idtr.limit));
+        vmwrite(vmcs::guest::GDTR_BASE, guest_desc.gdtr.base as u64);
+        vmwrite(vmcs::guest::IDTR_BASE, guest_desc.idtr.base as u64);
+        vmwrite(vmcs::guest::GDTR_LIMIT, u64::from(guest_desc.gdtr.limit));
+        vmwrite(vmcs::guest::IDTR_LIMIT, u64::from(guest_desc.idtr.limit));
 
-        // no shadow VMCS is linked
+        // no shadow vmcs is linked
         vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX);
     }
 }
 
-pub unsafe fn setup_host_registers_state(
-    host_descriptor: &Descriptors,
+pub unsafe fn setup_host_state(
+    host_desc: &Descriptors,
     host_cr3: u64,
     host_rsp: u64,
     host_rip: u64,
@@ -362,32 +344,31 @@ pub unsafe fn setup_host_registers_state(
         vmwrite(vmcs::host::ES_SELECTOR, host_selector(segmentation::es()));
         vmwrite(vmcs::host::FS_SELECTOR, host_selector(segmentation::fs()));
         vmwrite(vmcs::host::GS_SELECTOR, host_selector(segmentation::gs()));
-        vmwrite(vmcs::host::TR_SELECTOR, host_selector(host_descriptor.tr));
+        vmwrite(vmcs::host::TR_SELECTOR, host_selector(host_desc.tr));
 
         vmwrite(vmcs::host::FS_BASE, rdmsr(IA32_FS_BASE));
         vmwrite(vmcs::host::GS_BASE, rdmsr(IA32_GS_BASE));
-        vmwrite(vmcs::host::TR_BASE, host_descriptor.tss_base);
-        vmwrite(vmcs::host::GDTR_BASE, host_descriptor.gdtr.base as u64);
-        vmwrite(vmcs::host::IDTR_BASE, host_descriptor.idtr.base as u64);
+        vmwrite(vmcs::host::TR_BASE, host_desc.tss_base);
+        vmwrite(vmcs::host::GDTR_BASE, host_desc.gdtr.base as u64);
+        vmwrite(vmcs::host::IDTR_BASE, host_desc.idtr.base as u64);
 
         vmwrite(vmcs::host::RSP, host_rsp);
         vmwrite(vmcs::host::RIP, host_rip);
-
     }
 }
 
 const PINBASED_CTL: u32 = 0;
-const PRIMARY_CTL: u32 = 0;
-const SECONDARY_CTL: u32 = 0;
-// guest and host are both running in 64-bit mode here, so both must be forced on
+const PRIMARY_CTL: u32 = PrimaryControls::SECONDARY_CONTROLS.bits();
+const SECONDARY_CTL: u32 = SecondaryControls::ENABLE_EPT.bits();
+// both sides run in 64-bit mode
 const ENTRY_CTL: u32 = EntryControls::IA32E_MODE_GUEST.bits();
 const EXIT_CTL: u32 = ExitControls::HOST_ADDRESS_SPACE_SIZE.bits();
 
-pub unsafe fn setup_vmcs_control_fields(vcpu: &mut Vcpu) -> bool {
+pub unsafe fn setup_controls(vcpu: &mut Vcpu) -> bool {
     let pinbased = unsafe { adjust_pinbased_controls(PINBASED_CTL) };
     let primary = unsafe { adjust_primary_controls(PRIMARY_CTL) };
 
-    // IA32_VMX_PROCBASED_CTLS2 iff bit 31 is set
+    // secondary controls need primary bit 31
     let secondary = if primary & (1 << 31) != 0 {
         unsafe { adjust_secondary_controls(SECONDARY_CTL) }
     } else {
@@ -397,8 +378,17 @@ pub unsafe fn setup_vmcs_control_fields(vcpu: &mut Vcpu) -> bool {
     let entry = unsafe { adjust_entry_controls(ENTRY_CTL) };
     let exit = unsafe { adjust_exit_controls(EXIT_CTL) };
 
-    if entry & ENTRY_CTL != ENTRY_CTL || exit & EXIT_CTL != EXIT_CTL {
-        log::error!("required VM-entry/VM-exit controls unavailable on this CPU");
+    if primary & PRIMARY_CTL != PRIMARY_CTL
+        || secondary & SECONDARY_CTL != SECONDARY_CTL
+        || entry & ENTRY_CTL != ENTRY_CTL
+        || exit & EXIT_CTL != EXIT_CTL
+    {
+        log::error!("required EPT or VM-entry/VM-exit controls unavailable on this CPU");
+        return false;
+    }
+
+    if vcpu.ept.is_null() {
+        log::error!("cannot enable EPT without initialized per-vCPU state");
         return false;
     }
 
@@ -414,7 +404,9 @@ pub unsafe fn setup_vmcs_control_fields(vcpu: &mut Vcpu) -> bool {
         );
         vmwrite(vmcs::control::VMENTRY_CONTROLS, u64::from(entry));
         vmwrite(vmcs::control::VMEXIT_CONTROLS, u64::from(exit));
-        vmwrite(vmcs::control::MSR_BITMAPS_ADDR_FULL, vcpu.msr_bitmap_physical);
+        vmwrite(vmcs::control::MSR_BITMAPS_ADDR_FULL, vcpu.msr_bitmap_pa);
+        // eptp cache type is for the tables, not mapped ram
+        vmwrite(vmcs::control::EPTP_FULL, (*vcpu.ept).eptp());
 
         vmwrite(vmcs::control::CR0_GUEST_HOST_MASK, 0u64);
         vmwrite(vmcs::control::CR4_GUEST_HOST_MASK, 0u64);
@@ -446,15 +438,14 @@ pub unsafe fn setup_vmcs(vcpu: *mut Vcpu) -> bool {
     let vcpu = unsafe { &mut *vcpu };
 
     unsafe {
-        vmclear(vcpu.vmcs_physical);
-        vmptrld(vcpu.vmcs_physical);
+        vmclear(vcpu.vmcs_pa);
+        vmptrld(vcpu.vmcs_pa);
 
-        setup_guest_registers_state(&vcpu.guest_descriptor, &vcpu.guest_registers);
+        setup_guest_state(&vcpu.guest_desc, &vcpu.regs);
 
-        // launch_vm (vmlaunch.rs) overwrites HOST_RSP/HOST_RIP itself right
-        // before executing vmlaunch anyways :C
-        setup_host_registers_state(&vcpu.host_descriptor, x86::controlregs::cr3(), 0, 0);
+        // launch_vm fills host rsp/rip right before vmlaunch
+        setup_host_state(&vcpu.host_desc, x86::controlregs::cr3(), 0, 0);
 
-        setup_vmcs_control_fields(vcpu)
+        setup_controls(vcpu)
     }
 }

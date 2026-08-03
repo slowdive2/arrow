@@ -1,11 +1,15 @@
+extern crate alloc;
+
+use alloc::boxed::Box;
 use core::ffi::c_void;
-use core::ptr::{null_mut, write_bytes};
+use core::mem::size_of;
+use core::ptr::null_mut;
 
 use wdk_sys::{
     ntddk::{
-        ExAllocatePool2, ExFreePoolWithTag, KeGetCurrentProcessorNumber,
-        KeGetProcessorNumberFromIndex, KeQueryActiveProcessorCountEx,
-        KeRevertToUserGroupAffinityThread, KeSetSystemGroupAffinityThread, MmGetPhysicalAddress,
+        ExAllocatePool2, ExFreePoolWithTag, KeGetProcessorNumberFromIndex,
+        KeQueryActiveProcessorCountEx, KeRevertToUserGroupAffinityThread,
+        KeSetSystemGroupAffinityThread, MmGetPhysicalAddress,
     },
     GROUP_AFFINITY, KAFFINITY, POOL_FLAG_NON_PAGED, PROCESSOR_NUMBER,
 };
@@ -13,18 +17,16 @@ use wdk_sys::{
 use x86::msr::{rdmsr, IA32_VMX_BASIC};
 
 use crate::descriptor::Descriptors;
-use crate::exit::vmexit::{handle_vmexit, VmExitAction};
+use crate::ept::{build_mtrr_map, ept_supported, mtrr_default_type, Ept, MtrrRange};
+use crate::exit::vmexit::{handle, VmExitAction};
 use crate::support::vmxoff;
-use crate::vmcs::{capture_registers, setup_vmcs, GuestRegisters};
+use crate::vmcs::{capture_registers, setup_vmcs, GuestRegs};
 use crate::vmlaunch::launch_vm;
-use crate::vmx::{
-    adjust_control_regs, enable_vmx_operation, has_vmx_support, VmxRegion, VMX_REGION_SIZE,
-};
+use crate::vmx::{enable_vmx, has_vmx_support, VmxRegion, VMX_REGION_SIZE};
 
 const VMM_TAG: u32 = u32::from_le_bytes(*b"Arro");
 const ALL_PROCESSOR_GROUPS: u16 = 0xffff;
 const PAGE_SIZE: usize = 0x1000;
-const VMM_STACK_SIZE: usize = 0x6000;
 const VMX_REVISION_ID_MASK: u32 = 0x7fff_ffff;
 
 unsafe fn phys_of(ptr: *mut c_void) -> u64 {
@@ -32,7 +34,7 @@ unsafe fn phys_of(ptr: *mut c_void) -> u64 {
 }
 
 #[inline]
-unsafe fn free_if_non_null<T>(ptr: *mut T) {
+unsafe fn free_pool<T>(ptr: *mut T) {
     if !ptr.is_null() {
         unsafe { ExFreePoolWithTag(ptr.cast(), VMM_TAG) };
     }
@@ -40,25 +42,31 @@ unsafe fn free_if_non_null<T>(ptr: *mut T) {
 
 pub struct Vcpu {
     pub vmcs: *mut VmxRegion,
-    pub vmcs_physical: u64,
+    pub vmcs_pa: u64,
     pub vmxon: *mut VmxRegion,
-    pub vmxon_physical: u64,
+    pub vmxon_pa: u64,
 
     pub msr_bitmap: *mut u8,
-    pub msr_bitmap_physical: u64,
-    pub guest_registers: GuestRegisters,
+    pub msr_bitmap_pa: u64,
+    // this cpu's ept and split pages
+    pub ept: *mut Ept,
+    pub regs: GuestRegs,
 
-    pub guest_descriptor: Descriptors,
-    pub host_descriptor: Descriptors,
-
-    pub vmm_context: *mut VmmContext,
+    pub guest_desc: Descriptors,
+    pub host_desc: Descriptors,
 }
 
-pub struct VmmContext {
-    // ExAllocatePool2 zeroes memory by default
-    processor_count: u32,
-    pub vcpu_table: *mut *mut Vcpu,
-    pub stack: *mut u8,
+#[inline]
+unsafe fn free_ept(ept: *mut Ept) {
+    if !ept.is_null() {
+        drop(unsafe { Box::from_raw(ept) });
+    }
+}
+
+pub struct Vmm {
+    // exallocatepool2 zeroes memory by default
+    cpu_count: u32,
+    pub vcpus: *mut *mut Vcpu,
 }
 
 pub unsafe fn init_vmxon(vcpu: *mut Vcpu) -> bool {
@@ -75,12 +83,12 @@ pub unsafe fn init_vmxon(vcpu: *mut Vcpu) -> bool {
     };
 
     let basic = unsafe { rdmsr(IA32_VMX_BASIC) };
-    let revision_identifier = (basic as u32) & VMX_REVISION_ID_MASK;
+    let revision_id = (basic as u32) & VMX_REVISION_ID_MASK;
 
     unsafe {
-        (*vmxon).header = revision_identifier;
+        (*vmxon).header = revision_id;
         (*vcpu).vmxon = vmxon;
-        (*vcpu).vmxon_physical = phys_of(vmxon.cast());
+        (*vcpu).vmxon_pa = phys_of(vmxon.cast());
     }
     true
 }
@@ -97,12 +105,12 @@ pub unsafe fn init_vmcs(vcpu: *mut Vcpu) -> bool {
         return false;
     };
     let basic = unsafe { rdmsr(IA32_VMX_BASIC) };
-    let revision_identifier = (basic as u32) & VMX_REVISION_ID_MASK;
+    let revision_id = (basic as u32) & VMX_REVISION_ID_MASK;
 
     unsafe {
-        (*vmcs).header = revision_identifier;
+        (*vmcs).header = revision_id;
         (*vcpu).vmcs = vmcs;
-        (*vcpu).vmcs_physical = phys_of(vmcs.cast());
+        (*vcpu).vmcs_pa = phys_of(vmcs.cast());
     }
     true
 }
@@ -120,91 +128,84 @@ pub unsafe fn init_msr_bitmap(vcpu: *mut Vcpu) -> bool {
     }
     unsafe {
         (*vcpu).msr_bitmap = msr_bitmap;
-        (*vcpu).msr_bitmap_physical = phys_of(msr_bitmap.cast());
+        (*vcpu).msr_bitmap_pa = phys_of(msr_bitmap.cast());
     }
     true
 }
 
-pub unsafe fn allocate_vmm_context() -> *mut VmmContext {
-    let processor_count = unsafe { KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) };
+pub unsafe fn alloc_vmm() -> *mut Vmm {
+    let cpu_count = unsafe { KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) };
 
-    if processor_count == 0 {
+    if cpu_count == 0 {
         log::error!("vmm.rs: No available processors",);
         return null_mut();
     };
 
-    let vcpu_tbl_len = size_of::<*mut Vcpu>() * processor_count as usize;
+    let table_size = size_of::<*mut Vcpu>() * cpu_count as usize;
 
-    let ctx: *mut VmmContext = unsafe {
-        ExAllocatePool2(POOL_FLAG_NON_PAGED, size_of::<VmmContext>() as u64, VMM_TAG).cast()
-    };
-    let vcpu_tbl: *mut *mut Vcpu =
-        unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, vcpu_tbl_len as u64, VMM_TAG).cast() };
-    let stack: *mut u8 =
-        unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, VMM_STACK_SIZE as u64, VMM_TAG).cast() };
+    let ctx: *mut Vmm =
+        unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, size_of::<Vmm>() as u64, VMM_TAG).cast() };
+    let vcpus: *mut *mut Vcpu =
+        unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, table_size as u64, VMM_TAG).cast() };
 
-    if ctx.is_null() || vcpu_tbl.is_null() || stack.is_null() {
+    if ctx.is_null() || vcpus.is_null() {
         if ctx.is_null() {
             log::error!(
                 "vmm.rs: ExAllocatePool2 failed: size={} tag={:#x}",
-                size_of::<VmmContext>(),
+                size_of::<Vmm>(),
                 VMM_TAG,
             );
         }
-        if vcpu_tbl.is_null() {
+        if vcpus.is_null() {
             log::error!(
                 "vmm.rs: ExAllocatePool2 failed: size={} tag={:#x}",
-                vcpu_tbl_len as u64,
-                VMM_TAG,
-            );
-        }
-        if stack.is_null() {
-            log::error!(
-                "vmm.rs: ExAllocatePool2 failed: size={} tag={:#x}",
-                VMM_STACK_SIZE as u64,
+                table_size as u64,
                 VMM_TAG,
             );
         }
         unsafe {
-            free_if_non_null(stack);
-            free_if_non_null(vcpu_tbl);
-            free_if_non_null(ctx);
+            free_pool(vcpus);
+            free_pool(ctx);
         }
         return null_mut();
     }
 
     unsafe {
-        (*ctx).processor_count = processor_count;
-        (*ctx).vcpu_table = vcpu_tbl;
-        write_bytes(stack, 0xcc, VMM_STACK_SIZE);
-        (*ctx).stack = stack;
+        (*ctx).cpu_count = cpu_count;
+        (*ctx).vcpus = vcpus;
     }
 
     ctx
 }
 
-pub unsafe fn init_vcpu() -> *mut Vcpu {
+pub unsafe fn init_vcpu(mtrrs: &[MtrrRange], default_type: u8) -> *mut Vcpu {
     let vcpu: *mut Vcpu =
         unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, size_of::<Vcpu>() as u64, VMM_TAG).cast() };
     if vcpu.is_null() {
         log::error!(
             "vmm.rs: ExAllocatePool2 failed: size={} tag={:#x}",
-            size_of::<VmmContext>(),
+            size_of::<Vcpu>(),
             VMM_TAG,
         );
         return null_mut();
     };
 
-    let vmxon_initialized = unsafe { init_vmxon(vcpu) };
-    let vmcs_initialized = unsafe { init_vmcs(vcpu) };
-    let msr_bitmap_initialized = unsafe { init_msr_bitmap(vcpu) };
+    let vmxon_ok = unsafe { init_vmxon(vcpu) };
+    let vmcs_ok = unsafe { init_vmcs(vcpu) };
+    let msr_ok = unsafe { init_msr_bitmap(vcpu) };
+    let ept = unsafe { Ept::new(mtrrs, default_type) };
+    let ept_ok = ept.is_some();
+    if let Some(ept) = ept {
+        unsafe { (*vcpu).ept = Box::into_raw(ept) };
+    }
 
-    if !vmxon_initialized || !vmcs_initialized || !msr_bitmap_initialized {
+    if !vmxon_ok || !vmcs_ok || !msr_ok || !ept_ok {
         unsafe {
-            free_if_non_null((*vcpu).msr_bitmap);
-            free_if_non_null((*vcpu).vmcs);
-            free_if_non_null((*vcpu).vmxon);
-            free_if_non_null(vcpu);
+            free_ept((*vcpu).ept);
+            free_pool((*vcpu).msr_bitmap);
+            free_pool((*vcpu).vmcs);
+            free_pool((*vcpu).vmxon);
+            free_pool(vcpu);
         }
         return null_mut();
     }
@@ -213,63 +214,70 @@ pub unsafe fn init_vcpu() -> *mut Vcpu {
 }
 
 pub unsafe fn vmm_init() -> bool {
-    let vmm_context: *mut VmmContext = unsafe { allocate_vmm_context() };
-    if vmm_context.is_null() {
+    // check before putting any eptp in a vmcs
+    if !has_vmx_support() || !ept_supported() {
         return false;
     }
 
-    let processor_count = unsafe { (*vmm_context).processor_count };
+    // firmware keeps mtrrs in sync, so read them once
+    let mtrrs = build_mtrr_map();
+    let default_type = mtrr_default_type();
 
-    // 1: allocate vcpus
-    let mut allocation_failed = false;
-    for index in 0..processor_count {
-        let vcpu = unsafe { init_vcpu() };
-        allocation_failed |= vcpu.is_null();
+    let ctx: *mut Vmm = unsafe { alloc_vmm() };
+    if ctx.is_null() {
+        return false;
+    }
+
+    let cpu_count = unsafe { (*ctx).cpu_count };
+
+    // allocate each vcpu first
+    let mut alloc_failed = false;
+    for i in 0..cpu_count {
+        let vcpu = unsafe { init_vcpu(&mtrrs, default_type) };
+        alloc_failed |= vcpu.is_null();
         if vcpu.is_null() {
-            log::error!("vcpu alloc failed for processor {}", index);
+            log::error!("vcpu alloc failed for processor {}", i);
         }
         unsafe {
-            *(*vmm_context).vcpu_table.add(index as usize) = vcpu;
-            if !vcpu.is_null() {
-                (*vcpu).vmm_context = vmm_context;
-            }
+            *(*ctx).vcpus.add(i as usize) = vcpu;
         }
     }
 
-    if allocation_failed {
+    if alloc_failed {
         unsafe {
-            for index in 0..processor_count {
-                let vcpu = *(*vmm_context).vcpu_table.add(index as usize);
+            for i in 0..cpu_count {
+                let vcpu = *(*ctx).vcpus.add(i as usize);
                 if !vcpu.is_null() {
-                    free_if_non_null((*vcpu).msr_bitmap);
-                    free_if_non_null((*vcpu).vmcs);
-                    free_if_non_null((*vcpu).vmxon);
+                    free_ept((*vcpu).ept);
+                    free_pool((*vcpu).msr_bitmap);
+                    free_pool((*vcpu).vmcs);
+                    free_pool((*vcpu).vmxon);
                 }
-                free_if_non_null(vcpu);
+                free_pool(vcpu);
             }
-            free_if_non_null((*vmm_context).stack);
-            free_if_non_null((*vmm_context).vcpu_table);
-            free_if_non_null(vmm_context);
+            free_pool((*ctx).vcpus);
+            free_pool(ctx);
         }
         return false;
     }
 
-    // 2: pin to each core and enter VMX
-    for index in 0..processor_count {
-        let mut proc_num = unsafe { core::mem::zeroed::<PROCESSOR_NUMBER>() };
+    // then enter vmx on each cpu
+    for i in 0..cpu_count {
+        let mut cpu_num = unsafe { core::mem::zeroed::<PROCESSOR_NUMBER>() };
         let mut aff = unsafe { core::mem::zeroed::<GROUP_AFFINITY>() };
         let mut old_aff = unsafe { core::mem::zeroed::<GROUP_AFFINITY>() };
 
-        unsafe { KeGetProcessorNumberFromIndex(index, &mut proc_num) };
-        aff.Group = proc_num.Group;
-        aff.Mask = (1 as KAFFINITY) << proc_num.Number;
+        unsafe { KeGetProcessorNumberFromIndex(i, &mut cpu_num) };
+        aff.Group = cpu_num.Group;
+        aff.Mask = (1 as KAFFINITY) << cpu_num.Number;
 
         unsafe { KeSetSystemGroupAffinityThread(&aff, &mut old_aff) };
-        let ok = unsafe { init_logical_processor(vmm_context) };
+        let vcpu = unsafe { *(*ctx).vcpus.add(i as usize) };
+        let ok = unsafe { init_cpu(vcpu, i) };
         unsafe { KeRevertToUserGroupAffinityThread(&old_aff) };
 
         if !ok {
-            log::error!("VMX init failed on processor {}", index);
+            log::error!("VMX init failed on processor {}", i);
             return false;
         }
     }
@@ -277,56 +285,46 @@ pub unsafe fn vmm_init() -> bool {
     true
 }
 
-pub unsafe fn init_logical_processor(vmm_context: *mut VmmContext) -> bool {
-    let processor_number = unsafe { KeGetCurrentProcessorNumber() };
-
-    let vcpu = unsafe { *(*vmm_context).vcpu_table.add(processor_number as usize) };
+pub unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> bool {
     if vcpu.is_null() {
-        log::error!("no vcpu for processor {}", processor_number);
+        log::error!("no vcpu for processor {}", cpu);
         return false;
     }
 
     if !has_vmx_support() {
-        log::error!("VMX not supported on processor {}", processor_number);
+        log::error!("VMX not supported on processor {}", cpu);
         return false;
     }
 
-    if !unsafe { enable_vmx_operation() } {
-        log::error!(
-            "enable_vmx_operation failed on processor {}",
-            processor_number
-        );
+    if !unsafe { enable_vmx() } {
+        log::error!("enable_vmx failed on processor {}", cpu);
         return false;
     }
 
-    if unsafe { x86::bits64::vmx::vmxon((*vcpu).vmxon_physical) }.is_err() {
+    if unsafe { x86::bits64::vmx::vmxon((*vcpu).vmxon_pa) }.is_err() {
         log::error!("VMXON instruction failed on vcpu {:p}", vcpu);
         return false;
     }
 
-    (*vcpu).guest_descriptor = Descriptors::capture_current();
+    (*vcpu).guest_desc = Descriptors::capture_current();
     // no separate host address space yet
-    (*vcpu).host_descriptor = Descriptors::capture_current();
+    (*vcpu).host_desc = Descriptors::capture_current();
 
-    log::info!(
-        "vcpu {:p} in VMX operation on processor {}",
-        vcpu,
-        processor_number
-    );
+    log::info!("vcpu {:p} in VMX operation on processor {}", vcpu, cpu);
 
-    unsafe { capture_registers(&mut (*vcpu).guest_registers) };
+    unsafe { capture_registers(&mut (*vcpu).regs) };
 
     if !unsafe { setup_vmcs(vcpu) } {
-        log::error!("setup_vmcs failed on processor {}", processor_number);
+        log::error!("setup_vmcs failed on processor {}", cpu);
         vmxoff();
         return false;
     }
 
     let mut launched = 0u64;
     loop {
-        let rflags = unsafe { launch_vm(&mut (*vcpu).guest_registers, launched) };
+        let rflags = unsafe { launch_vm(&mut (*vcpu).regs, launched) };
 
-        if unsafe { handle_vmexit(rflags, &mut *vcpu) } == VmExitAction::Shutdown {
+        if unsafe { handle(rflags, &mut *vcpu) } == VmExitAction::Shutdown {
             vmxoff();
             return true;
         }

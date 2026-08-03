@@ -10,10 +10,14 @@ const DPFLTR_INFO_LEVEL: u32 = 3;
 struct DbgPrintLogger;
 
 impl Log for DbgPrintLogger {
-    fn enabled(&self, m: &Metadata) -> bool { m.level() <= log::Level::Trace }
+    fn enabled(&self, m: &Metadata) -> bool {
+        m.level() <= log::Level::Trace
+    }
 
     fn log(&self, record: &Record) {
-        if !self.enabled(record.metadata()) { return; }
+        if !self.enabled(record.metadata()) {
+            return;
+        }
 
         let mut buf = LogBuffer::new();
         let _ = write!(

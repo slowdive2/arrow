@@ -2,13 +2,11 @@
 //
 // Copyright (c) 2022 memN0ps
 //
-// This file is derived from the illusion-rs project:
+// this file is derived from the illusion-rs project:
 // https://github.com/memN0ps/illusion-rs
 //
-// Original source:
+// original source:
 // https://github.com/memN0ps/illusion-rs/blob/main/hypervisor/src/intel/support.rs
-
-
 
 #![allow(dead_code)]
 use core::arch::asm;
@@ -50,14 +48,32 @@ where
     unsafe { x86::bits64::vmx::vmwrite(field, u64::from(val)) }.unwrap();
 }
 
-/// wr to Extended Control Register XCR0 ; only supported if CR4_ENABLE_OS_XSAVE is set
+// watch one page on this cpu's ept
+pub unsafe fn vmcall_watch_exec(gpa: u64) -> bool {
+    use crate::exit::vmcall::{ARROW_HYPERCALL_MAGIC, HYPERCALL_ARM_EXECUTE_MONITOR};
+
+    let status: u64;
+    unsafe {
+        asm!(
+            "vmcall",
+            in("rcx") HYPERCALL_ARM_EXECUTE_MONITOR,
+            in("rdx") gpa,
+            in("r10") ARROW_HYPERCALL_MAGIC,
+            lateout("rax") status,
+            options(nostack),
+        );
+    }
+    status == 0
+}
+
+// write xcr0 when osxsave is on
 pub fn xsetbv(val: u64) {
     unsafe {
         x86::controlregs::xcr0_write(x86::controlregs::Xcr0::from_bits_truncate(val));
     }
 }
 
-/// wr back all modified cache contents to memory and invalidate the caches
+// flush all caches
 #[inline(always)]
 pub fn wbinvd() {
     unsafe {
@@ -65,7 +81,7 @@ pub fn wbinvd() {
     }
 }
 
-/// returns the timestamp counter value
+// read tsc
 pub fn rdtsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
@@ -98,14 +114,16 @@ pub fn cr4_write(val: u64) {
     unsafe { x86::controlregs::cr4_write(x86::controlregs::Cr4::from_bits_truncate(val as usize)) };
 }
 
-pub fn read_effective_guest_cr0() -> u64 {
+pub fn guest_cr0() -> u64 {
     let mask = vmread(x86::vmx::vmcs::control::CR0_GUEST_HOST_MASK);
-    vmread(x86::vmx::vmcs::control::CR0_READ_SHADOW) & mask | vmread(x86::vmx::vmcs::guest::CR0) & !mask
+    vmread(x86::vmx::vmcs::control::CR0_READ_SHADOW) & mask
+        | vmread(x86::vmx::vmcs::guest::CR0) & !mask
 }
 
-pub fn read_effective_guest_cr4() -> u64 {
+pub fn guest_cr4() -> u64 {
     let mask = vmread(x86::vmx::vmcs::control::CR4_GUEST_HOST_MASK);
-    vmread(x86::vmx::vmcs::control::CR4_READ_SHADOW) & mask | vmread(x86::vmx::vmcs::guest::CR4) & !mask
+    vmread(x86::vmx::vmcs::control::CR4_READ_SHADOW) & mask
+        | vmread(x86::vmx::vmcs::guest::CR4) & !mask
 }
 
 pub fn cr2_write(val: u64) {
@@ -157,7 +175,7 @@ pub fn dr7_read() -> u64 {
     unsafe { x86::debugregs::dr7().0 as u64 }
 }
 
-/// disables maskable interrupts.
+// disable maskable interrupts
 pub fn cli() {
     unsafe { x86::irq::disable() };
 }
@@ -166,24 +184,24 @@ pub fn hlt() {
     unsafe { x86::halt() };
 }
 
-/// reads 8-bits from an IO port
+// read an io byte
 pub fn inb(port: u16) -> u8 {
     unsafe { x86::io::inb(port) }
 }
 
-/// writes 8-bits to an IO port
+// write an io byte
 pub fn outb(port: u16, val: u8) {
     unsafe { x86::io::outb(port, val) };
 }
 
-/// reads the IDTR
+// reads the idtr
 pub fn sidt() -> x86::dtables::DescriptorTablePointer<u64> {
     let mut idtr = x86::dtables::DescriptorTablePointer::<u64>::default();
     unsafe { x86::dtables::sidt(&mut idtr) };
     idtr
 }
 
-/// reads the GDTR
+// reads the gdtr
 pub fn sgdt() -> x86::dtables::DescriptorTablePointer<u64> {
     let mut gdtr = x86::dtables::DescriptorTablePointer::<u64>::default();
     unsafe { x86::dtables::sgdt(&mut gdtr) };

@@ -31,9 +31,9 @@ enum FeatureBits {
     HypervisorPresentBit = 31,
 }
 
-pub fn handle_cpuid(vcpu: &mut Vcpu) -> VmExitAction {
-    let leaf = vcpu.guest_registers.rax as u32;
-    let subleaf = vcpu.guest_registers.rcx as u32;
+pub fn handle(vcpu: &mut Vcpu) -> VmExitAction {
+    let leaf = vcpu.regs.rax as u32;
+    let subleaf = vcpu.regs.rcx as u32;
 
     let mut cpuid_result = unsafe { __cpuid_count(leaf, subleaf) };
 
@@ -47,10 +47,10 @@ pub fn handle_cpuid(vcpu: &mut Vcpu) -> VmExitAction {
         log::debug!("cpuid: generic leaf={leaf:#x}, subleaf={subleaf:#x}");
     }
 
-    vcpu.guest_registers.rax = cpuid_result.eax as u64;
-    vcpu.guest_registers.rbx = cpuid_result.ebx as u64;
-    vcpu.guest_registers.rcx = cpuid_result.ecx as u64;
-    vcpu.guest_registers.rdx = cpuid_result.edx as u64;
+    vcpu.regs.rax = cpuid_result.eax as u64;
+    vcpu.regs.rbx = cpuid_result.ebx as u64;
+    vcpu.regs.rcx = cpuid_result.ecx as u64;
+    vcpu.regs.rdx = cpuid_result.edx as u64;
 
     VmExitAction::ResumeAndAdvance
 }

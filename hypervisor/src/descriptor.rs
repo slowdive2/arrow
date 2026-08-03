@@ -13,7 +13,7 @@ pub struct Descriptors {
 }
 
 impl Descriptors {
-    /// snapshot current cpu state for guest
+    // snapshot current cpu state for guest
     pub unsafe fn capture_current() -> Self {
         let mut gdtr = DescriptorTablePointer::default();
         let mut idtr = DescriptorTablePointer::default();
@@ -21,9 +21,7 @@ impl Descriptors {
         unsafe { sidt(&mut idtr) };
 
         let tr = unsafe { read_tr() };
-        let (tss_base, tss_limit, tss_ar) = unsafe {
-            resolve_tss_descriptor(gdtr.base as *const u64, tr)
-        };
+        let (tss_base, tss_limit, tss_ar) = unsafe { read_tss(gdtr.base as *const u64, tr) };
 
         Self {
             gdtr,
@@ -42,16 +40,16 @@ unsafe fn read_tr() -> SegmentSelector {
     SegmentSelector::from_raw(sel)
 }
 
-unsafe fn resolve_tss_descriptor(gdt_base: *const u64, tr: SegmentSelector) -> (u64, u32, u32) {
-    // tss descriptor in long mode is 16 bytes (2 GDT slots)
+unsafe fn read_tss(gdt_base: *const u64, tr: SegmentSelector) -> (u64, u32, u32) {
+    // tss descriptor in long mode is 16 bytes (2 gdt slots)
     // base = 63:56 of high | 39:16 of low
     // limit = 19:16 of high | 15:0 of low
-    // access rights derived from low bits 47:40 + G bit + AVL
+    // access rights derived from low bits 47:40 + g bit + avl
     let index = tr.index() as usize;
-    let low  = unsafe { *gdt_base.add(index) };
+    let low = unsafe { *gdt_base.add(index) };
     let high = unsafe { *gdt_base.add(index + 1) };
 
-    let base_low  = ((low >> 16) & 0xff_ffff) | (((low >> 56) & 0xff) << 24);
+    let base_low = ((low >> 16) & 0xff_ffff) | (((low >> 56) & 0xff) << 24);
     let base_high = high & 0xffff_ffff;
     let base = base_low | (base_high << 32);
 

@@ -2,9 +2,8 @@ use core::arch::x86_64::__cpuid;
 
 use x86::controlregs::{cr0, cr0_write, cr4, cr4_write};
 use x86::msr::{
-    self, rdmsr, wrmsr, IA32_FEATURE_CONTROL, IA32_VMX_BASIC,
-    IA32_VMX_CR0_FIXED0, IA32_VMX_CR0_FIXED1,
-    IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1,
+    self, rdmsr, wrmsr, IA32_FEATURE_CONTROL, IA32_VMX_BASIC, IA32_VMX_CR0_FIXED0,
+    IA32_VMX_CR0_FIXED1, IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1,
 };
 
 pub const VMX_REGION_SIZE: usize = 0x1000;
@@ -46,8 +45,7 @@ pub unsafe fn adjust_control_regs() {
     let cr4_fixed0 = unsafe { rdmsr(IA32_VMX_CR4_FIXED0) };
     let cr4_fixed1 = unsafe { rdmsr(IA32_VMX_CR4_FIXED1) };
 
-    let adjusted_cr4 =
-        ((current_cr4 | CR4_VMXE) | cr4_fixed0) & cr4_fixed1;
+    let adjusted_cr4 = ((current_cr4 | CR4_VMXE) | cr4_fixed0) & cr4_fixed1;
 
     unsafe {
         cr4_write(x86::controlregs::Cr4::from_bits_truncate(
@@ -56,7 +54,7 @@ pub unsafe fn adjust_control_regs() {
     }
 }
 
-pub unsafe fn enable_vmx_operation() -> bool {
+pub unsafe fn enable_vmx() -> bool {
     const VMX_LOCK_BIT: u64 = 1 << 0;
     const VMXON_OUTSIDE_SMX: u64 = 1 << 2;
 
@@ -74,9 +72,7 @@ pub unsafe fn enable_vmx_operation() -> bool {
             );
         }
     } else if feature_control & VMXON_OUTSIDE_SMX == 0 {
-        log::error!(
-            "VMX disabled by BIOS: FEATURE_CONTROL locked without VMXON_OUTSIDE_SMX"
-        );
+        log::error!("VMX disabled by BIOS: FEATURE_CONTROL locked without VMXON_OUTSIDE_SMX");
         return false;
     }
 
@@ -85,7 +81,7 @@ pub unsafe fn enable_vmx_operation() -> bool {
 
 const IA32_VMX_BASIC_TRUE_CONTROLS: u64 = 1 << 55;
 
-fn true_controls_supported() -> bool {
+fn has_true_controls() -> bool {
     let basic = unsafe { rdmsr(IA32_VMX_BASIC) };
     basic & IA32_VMX_BASIC_TRUE_CONTROLS != 0
 }
@@ -99,12 +95,8 @@ unsafe fn adjust_cv(capability_msr: u32, requested: u32) -> u32 {
     (requested | allowed_zero) & allowed_one
 }
 
-unsafe fn adjust_true_control(
-    requested: u32,
-    legacy_msr: u32,
-    true_msr: u32,
-) -> u32 {
-    let capability_msr = if true_controls_supported() {
+unsafe fn adjust_true_control(requested: u32, legacy_msr: u32, true_msr: u32) -> u32 {
+    let capability_msr = if has_true_controls() {
         true_msr
     } else {
         legacy_msr
@@ -134,12 +126,7 @@ pub unsafe fn adjust_primary_controls(requested: u32) -> u32 {
 }
 
 pub unsafe fn adjust_secondary_controls(requested: u32) -> u32 {
-    unsafe {
-        adjust_cv(
-            msr::IA32_VMX_PROCBASED_CTLS2,
-            requested,
-        )
-    }
+    unsafe { adjust_cv(msr::IA32_VMX_PROCBASED_CTLS2, requested) }
 }
 
 pub unsafe fn adjust_exit_controls(requested: u32) -> u32 {

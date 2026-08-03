@@ -61,21 +61,23 @@ unsafe fn inject_exception(vcpu: &mut Vcpu, event: VmEntryEvent) {
         vmwrite(vmcs::control::VMENTRY_INSTRUCTION_LEN, 0u64);
 
         if let Some(error_code) = event.error_code {
-            vmwrite(vmcs::control::VMENTRY_EXCEPTION_ERR_CODE, u64::from(error_code));
+            vmwrite(
+                vmcs::control::VMENTRY_EXCEPTION_ERR_CODE,
+                u64::from(error_code),
+            );
         }
     }
 
-    // the vm-exit did not occur during delivery of an event through the IDT,
-    // so RFLAGS.RF must be set to 1 before re-entering the guest
+    // rf avoids retriggering the same fault on entry
     // https://revers.engineering/day-5-vmexits-interrupts-cpuid-emulation/
-    vcpu.guest_registers.rflags.set_bit(RFLAGS_RF_BIT, true);
+    vcpu.regs.rflags.set_bit(RFLAGS_RF_BIT, true);
     unsafe {
-        vmwrite(vmcs::guest::RFLAGS, vcpu.guest_registers.rflags);
+        vmwrite(vmcs::guest::RFLAGS, vcpu.regs.rflags);
     }
 }
 
-pub unsafe fn inject_invalidopcode(vcpu: &mut Vcpu) -> VmExitAction {
-    // make the intercepted instruction appear to the guest as unsupported (#UD)
+pub unsafe fn inject_ud(vcpu: &mut Vcpu) -> VmExitAction {
+    // make the instruction look unsupported
     unsafe { inject_exception(vcpu, VmEntryEvent::exception(VECTOR_INVALID_OPCODE, None)) };
     VmExitAction::ResumeWithoutAdvance
 }

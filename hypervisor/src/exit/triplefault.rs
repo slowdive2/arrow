@@ -18,8 +18,8 @@ struct ResetControlRegister {
     __: u8,
 }
 
-// requests a physical platform reset through I/O port 0xCF9 - doesnt return
-pub unsafe fn platform_hard_reset() -> ! {
+// reset through port 0xcf9
+pub unsafe fn reset() -> ! {
     let raw_register = unsafe { inb(RST_CNT_IO_PORT) };
 
     let mut reset_register = ResetControlRegister::from(raw_register);
@@ -33,7 +33,7 @@ pub unsafe fn platform_hard_reset() -> ! {
         outb(RST_CNT_IO_PORT, raw_register);
     }
 
-    // dont continue executing if the reset request fails.. shouldnt happen anyways
+    // dont keep running if reset fails
     loop {
         core::hint::spin_loop();
     }
@@ -44,15 +44,15 @@ fn dump_vcpu_state(vcpu: &Vcpu) {
         "triple fault: rip={:#x} rsp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}",
         vmread(vmcs::guest::RIP),
         vmread(vmcs::guest::RSP),
-        vcpu.guest_registers.rax,
-        vcpu.guest_registers.rbx,
-        vcpu.guest_registers.rcx,
-        vcpu.guest_registers.rdx,
+        vcpu.regs.rax,
+        vcpu.regs.rbx,
+        vcpu.regs.rcx,
+        vcpu.regs.rdx,
     );
 }
 
-pub unsafe fn handle_triple_fault(vcpu: &Vcpu) -> ! {
+pub unsafe fn handle(vcpu: &Vcpu) -> ! {
     dump_vcpu_state(vcpu);
 
-    unsafe { platform_hard_reset() }
+    unsafe { reset() }
 }

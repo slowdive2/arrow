@@ -1,34 +1,48 @@
-use x86::msr::{rdmsr,};
+// only check the ept bits used below
 
-/// `IA32_MTRR_DEF_TYPE`
+use bitfield_struct::bitfield;
+use x86::msr::{IA32_MTRR_DEF_TYPE, IA32_VMX_EPT_VPID_CAP};
+
+use crate::support::rdmsr;
+
+const WALK_4: u64 = 1 << 6;
+const EPT_WB: u64 = 1 << 14;
+const PAGE_2MB: u64 = 1 << 16;
+const INVEPT: u64 = 1 << 20;
+const INVEPT_SINGLE: u64 = 1 << 25;
+
+// ia32_mtrr_def_type
 #[bitfield(u64)]
 #[derive(PartialEq, Eq)]
-pub struct Ia32MtrrDefTypeRegister {
-    /// default memory type used when no enabled mtrr covers an address
+pub struct MtrrDefType {
     #[bits(3)]
-    pub default_memory_type: u8,
-    /// reserved, keep zero
+    pub default_type: u8,
     #[bits(7)]
     __: u8,
-    /// enables the fixed-range mtrrs when mtrrs are globally enabled
-    pub fixed_range_mtrr_enabled: bool,
-    /// globally enables fixed-range and variable-range mtrrs
-    pub mtrr_enabled: bool,
-    /// reserved, keep zero
+    pub fixed_enabled: bool,
+    pub enabled: bool,
     #[bits(52)]
     __: u64,
 }
 
-const IA32_MTRR_CAP : u32 = 0xFE;
+pub fn ept_supported() -> bool {
+    let caps = rdmsr(IA32_VMX_EPT_VPID_CAP);
+    let needed = WALK_4 | EPT_WB | PAGE_2MB | INVEPT | INVEPT_SINGLE;
 
-pub const unsafe fn ept_check_features() -> bool {
-
-    let mtrr_def_type = rdmsr(Ia32MtrrDefTypeRegister);
-
-    if !mtrr_def_type.mtrr_enabled {
-        log::error!("mtrr not enabled (mtrr dynamic ranges not supported)");
-        return 0;
+    if caps & needed != needed {
+        log::error!("required ept features r missing");
+        return false;
     }
 
+    let def = MtrrDefType::from_bits(rdmsr(IA32_MTRR_DEF_TYPE));
+    if !def.enabled() {
+        log::error!("mtrrs r disabled");
+        return false;
+    }
 
-}   
+    true
+}
+
+pub fn mtrr_default_type() -> u8 {
+    MtrrDefType::from_bits(rdmsr(IA32_MTRR_DEF_TYPE)).default_type()
+}
