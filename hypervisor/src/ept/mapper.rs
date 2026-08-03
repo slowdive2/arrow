@@ -118,7 +118,7 @@ pub fn build_mtrr_map() -> Vec<MtrrRange> {
     ranges
 }
 
-// 11.11.4.1 MTRR Precedences 
+// sdm 11.11.4.1 mtrr precedence
 // uc takes precedence.. wt wins when it overlaps wb
 pub(super) fn mtrr_type(ranges: &[MtrrRange], default_type: u8, pa: u64) -> u8 {
     mtrr_type_for_range(ranges, default_type, pa, pa)

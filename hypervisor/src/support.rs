@@ -10,6 +10,7 @@
 
 #![allow(dead_code)]
 use core::arch::asm;
+use wdk_sys::ntddk::KeIpiGenericCall;
 
 pub fn vmxon(vmxon_region: u64) {
     unsafe { x86::bits64::vmx::vmxon(vmxon_region).unwrap() };
@@ -48,8 +49,7 @@ where
     unsafe { x86::bits64::vmx::vmwrite(field, u64::from(val)) }.unwrap();
 }
 
-// watch one page on this cpu's ept
-pub unsafe fn vmcall_watch_exec(gpa: u64) -> bool {
+unsafe fn vmcall_watch_exec_here(gpa: u64) -> bool {
     use crate::exit::vmcall::{ARROW_HYPERCALL_MAGIC, HYPERCALL_ARM_EXECUTE_MONITOR};
 
     let status: u64;
@@ -64,6 +64,19 @@ pub unsafe fn vmcall_watch_exec(gpa: u64) -> bool {
         );
     }
     status == 0
+}
+
+unsafe extern "system" fn watch_exec_cpu(gpa: usize) -> usize {
+    if unsafe { vmcall_watch_exec_here(gpa as u64) } {
+        1
+    } else {
+        0
+    }
+}
+
+// each cpu runs vmcall so each one flushes its cached ept entry
+pub unsafe fn vmcall_watch_exec(gpa: u64) -> bool {
+    unsafe { KeIpiGenericCall(Some(watch_exec_cpu), gpa as usize) != 0 }
 }
 
 // write xcr0 when osxsave is on

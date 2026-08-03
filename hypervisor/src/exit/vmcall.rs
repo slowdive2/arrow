@@ -18,7 +18,7 @@ pub unsafe fn handle(vcpu: &mut Vcpu) -> Option<VmExitAction> {
 
     let result = match vcpu.regs.rcx {
         HYPERCALL_ARM_EXECUTE_MONITOR if !vcpu.ept.is_null() => unsafe {
-            (*vcpu.ept).watch_exec(vcpu.regs.rdx)
+            crate::ept::Ept::watch_exec(vcpu.ept, vcpu.regs.rdx)
         },
         service => {
             log::warn!("unknown Arrow hypercall service {service:#x}");

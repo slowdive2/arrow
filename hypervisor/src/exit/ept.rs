@@ -6,12 +6,12 @@ use super::vmexit::VmExitAction;
 
 pub unsafe fn handle_violation(vcpu: &mut Vcpu, qual: u64, gpa: u64) -> VmExitAction {
     if vcpu.ept.is_null() {
-        log::error!("EPT violation without per-vCPU EPT state");
+        log::error!("EPT violation without shared EPT state");
         return VmExitAction::Shutdown;
     }
 
     let qual = EptViolationQualification::from_bits(qual);
-    match unsafe { (*vcpu.ept).handle_violation(qual, gpa) } {
+    match unsafe { crate::ept::Ept::handle_violation(vcpu.ept, qual, gpa) } {
         Ok(true) => VmExitAction::ResumeWithoutAdvance,
         Ok(false) => {
             log::error!(

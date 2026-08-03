@@ -3,7 +3,12 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, vec::Vec};
-use core::{ptr, ptr::NonNull};
+use core::{
+    hint::spin_loop,
+    ptr,
+    ptr::NonNull,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use bitfield_struct::bitfield;
 use wdk_sys::{
@@ -24,6 +29,22 @@ pub const SPLIT_COUNT: usize = 16;
 const EPT_LARGE_PAGE_MASK: u64 = EPT_LARGE_PAGE_SIZE - 1;
 const EPT_PAGE_MASK: u64 = EPT_PAGE_SIZE as u64 - 1;
 const EPT_LARGE_PAGE_BIT: u64 = 1 << 7;
+
+// one shared map means one tiny edit lock is enough
+static EPT_LOCK: AtomicBool = AtomicBool::new(false);
+
+fn lock_ept() {
+    while EPT_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        spin_loop();
+    }
+}
+
+fn unlock_ept() {
+    EPT_LOCK.store(false, Ordering::Release);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EptError {
@@ -54,7 +75,7 @@ pub struct EptViolationQualification {
     __: u64,
 }
 
-// one ept per vcpu keeps edits local .. avoids locks (for now
+// all vcpus point at this one map
 pub struct Ept {
     map: NonNull<EptPageMap>,
     eptp: u64,
@@ -137,7 +158,7 @@ impl Ept {
     }
 
     // replace one 2 mib pde with 512 matching 4 kib ptes
-    pub fn split_2mb(&mut self, gpa: u64) -> Result<(), EptError> {
+    fn split_2mb(&mut self, gpa: u64) -> Result<(), EptError> {
         let pde = self.pde(gpa)?;
         let raw = unsafe { (*pde).raw };
         if raw & EPT_LARGE_PAGE_BIT == 0 {
@@ -178,8 +199,8 @@ impl Ept {
         Ok(())
     }
 
-    // trap the next execute from this 4 kib page
-    pub unsafe fn watch_exec(&mut self, gpa: u64) -> Result<(), EptError> {
+    // every broadcast caller also flushes its own cpu
+    fn watch_exec_locked(&mut self, gpa: u64) -> Result<(), EptError> {
         self.split_2mb(gpa)?;
         let pte = self.pte(gpa & !EPT_PAGE_MASK)?;
         unsafe { ptr::write(pte, (*pte).with_executable(false)) };
@@ -190,7 +211,7 @@ impl Ept {
     }
 
     // restore execute and retry the faulting instruction
-    pub unsafe fn handle_violation(
+    fn handle_violation_locked(
         &mut self,
         qual: EptViolationQualification,
         gpa: u64,
@@ -206,8 +227,13 @@ impl Ept {
         };
 
         let old = unsafe { *pte };
+
+        // another cpu restored it, but this cpu still cached the old pte
         if old.executable() {
-            return Ok(false);
+            if !unsafe { invept_single(self.eptp) } {
+                return Err(EptError::InveptFailed);
+            }
+            return Ok(true);
         }
 
         unsafe { ptr::write(pte, old.with_executable(true)) };
@@ -215,6 +241,26 @@ impl Ept {
             return Err(EptError::InveptFailed);
         }
         Ok(true)
+    }
+
+    // serialize edits to the shared map
+    pub unsafe fn watch_exec(ept: *mut Self, gpa: u64) -> Result<(), EptError> {
+        lock_ept();
+        let result = unsafe { (&mut *ept).watch_exec_locked(gpa) };
+        unlock_ept();
+        result
+    }
+
+    // serialize the one-shot restore too
+    pub unsafe fn handle_violation(
+        ept: *mut Self,
+        qual: EptViolationQualification,
+        gpa: u64,
+    ) -> Result<bool, EptError> {
+        lock_ept();
+        let result = unsafe { (&mut *ept).handle_violation_locked(qual, gpa) };
+        unlock_ept();
+        result
     }
 }
 

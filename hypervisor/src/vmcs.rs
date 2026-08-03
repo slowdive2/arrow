@@ -388,7 +388,7 @@ pub unsafe fn setup_controls(vcpu: &mut Vcpu) -> bool {
     }
 
     if vcpu.ept.is_null() {
-        log::error!("cannot enable EPT without initialized per-vCPU state");
+        log::error!("cannot enable EPT without shared EPT state");
         return false;
     }
 

@@ -17,7 +17,7 @@ use wdk_sys::{
 use x86::msr::{rdmsr, IA32_VMX_BASIC};
 
 use crate::descriptor::Descriptors;
-use crate::ept::{build_mtrr_map, ept_supported, mtrr_default_type, Ept, MtrrRange};
+use crate::ept::{build_mtrr_map, ept_supported, mtrr_default_type, Ept};
 use crate::exit::vmexit::{handle, VmExitAction};
 use crate::support::vmxoff;
 use crate::vmcs::{capture_registers, setup_vmcs, GuestRegs};
@@ -48,7 +48,7 @@ pub struct Vcpu {
 
     pub msr_bitmap: *mut u8,
     pub msr_bitmap_pa: u64,
-    // this cpu's ept and split pages
+    // every cpu borrows the same ept
     pub ept: *mut Ept,
     pub regs: GuestRegs,
 
@@ -67,6 +67,7 @@ pub struct Vmm {
     // exallocatepool2 zeroes memory by default
     cpu_count: u32,
     pub vcpus: *mut *mut Vcpu,
+    pub ept: *mut Ept,
 }
 
 pub unsafe fn init_vmxon(vcpu: *mut Vcpu) -> bool {
@@ -133,7 +134,7 @@ pub unsafe fn init_msr_bitmap(vcpu: *mut Vcpu) -> bool {
     true
 }
 
-pub unsafe fn alloc_vmm() -> *mut Vmm {
+pub unsafe fn alloc_vmm(ept: *mut Ept) -> *mut Vmm {
     let cpu_count = unsafe { KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) };
 
     if cpu_count == 0 {
@@ -173,12 +174,13 @@ pub unsafe fn alloc_vmm() -> *mut Vmm {
     unsafe {
         (*ctx).cpu_count = cpu_count;
         (*ctx).vcpus = vcpus;
+        (*ctx).ept = ept;
     }
 
     ctx
 }
 
-pub unsafe fn init_vcpu(mtrrs: &[MtrrRange], default_type: u8) -> *mut Vcpu {
+pub unsafe fn init_vcpu(ept: *mut Ept) -> *mut Vcpu {
     let vcpu: *mut Vcpu =
         unsafe { ExAllocatePool2(POOL_FLAG_NON_PAGED, size_of::<Vcpu>() as u64, VMM_TAG).cast() };
     if vcpu.is_null() {
@@ -193,15 +195,10 @@ pub unsafe fn init_vcpu(mtrrs: &[MtrrRange], default_type: u8) -> *mut Vcpu {
     let vmxon_ok = unsafe { init_vmxon(vcpu) };
     let vmcs_ok = unsafe { init_vmcs(vcpu) };
     let msr_ok = unsafe { init_msr_bitmap(vcpu) };
-    let ept = unsafe { Ept::new(mtrrs, default_type) };
-    let ept_ok = ept.is_some();
-    if let Some(ept) = ept {
-        unsafe { (*vcpu).ept = Box::into_raw(ept) };
-    }
+    unsafe { (*vcpu).ept = ept };
 
-    if !vmxon_ok || !vmcs_ok || !msr_ok || !ept_ok {
+    if !vmxon_ok || !vmcs_ok || !msr_ok {
         unsafe {
-            free_ept((*vcpu).ept);
             free_pool((*vcpu).msr_bitmap);
             free_pool((*vcpu).vmcs);
             free_pool((*vcpu).vmxon);
@@ -222,18 +219,25 @@ pub unsafe fn vmm_init() -> bool {
     // firmware keeps mtrrs in sync, so read them once
     let mtrrs = build_mtrr_map();
     let default_type = mtrr_default_type();
+    // this needs special consideration.. lifecycle is roughly:
+    // ept::new -> box::into_raw to avoid destruction -> ... free_ept..box::from_raw MANUALLY reconstructs to free
+    // this kinda (definitely) goes against rust's philosophy
+    let Some(ept) = (unsafe { Ept::new(&mtrrs, default_type) }) else {
+        return false;
+    };
+    let ept = Box::into_raw(ept);
 
-    let ctx: *mut Vmm = unsafe { alloc_vmm() };
+    let ctx: *mut Vmm = unsafe { alloc_vmm(ept) };
     if ctx.is_null() {
+        unsafe { free_ept(ept) };
         return false;
     }
-
     let cpu_count = unsafe { (*ctx).cpu_count };
 
     // allocate each vcpu first
     let mut alloc_failed = false;
     for i in 0..cpu_count {
-        let vcpu = unsafe { init_vcpu(&mtrrs, default_type) };
+        let vcpu = unsafe { init_vcpu(ept) };
         alloc_failed |= vcpu.is_null();
         if vcpu.is_null() {
             log::error!("vcpu alloc failed for processor {}", i);
@@ -248,13 +252,13 @@ pub unsafe fn vmm_init() -> bool {
             for i in 0..cpu_count {
                 let vcpu = *(*ctx).vcpus.add(i as usize);
                 if !vcpu.is_null() {
-                    free_ept((*vcpu).ept);
                     free_pool((*vcpu).msr_bitmap);
                     free_pool((*vcpu).vmcs);
                     free_pool((*vcpu).vmxon);
                 }
                 free_pool(vcpu);
             }
+            free_ept((*ctx).ept);
             free_pool((*ctx).vcpus);
             free_pool(ctx);
         }
