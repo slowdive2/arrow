@@ -1,10 +1,8 @@
-arrow is a rust hypervisor... 
+Arrow is a minimal hypervisor written in rust.
 
-currently traps-and-emulates a few categories (see hypervisor/src/exit/), spoofs hypervisor cpuid checks,
-supports msr r/w, vmx -> #UD exception
+Currently supports VM-exit handling, MSR interception, exception injection, and a synchronized EPT implementation.
 
-ept is synchronized across all cores, MTRR-derived leaf types,
-on-demand 2 MiB-to-4 KiB splits, `INVEPT`, and an execute monitor (1 shot)
+The EPT subsystem currently identity-maps & derives memory-types from MTRRs, maintaining originality with the original guest being hyperjacked. 2mb - 4kB page splitting + execution monitoring is currently supported. 
 
 WIP:
 vmx non-root (user level) hooking calls &&
