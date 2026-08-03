@@ -1,4 +1,4 @@
-# Arrow is a minimal hypervisor written in rust.
+# Arrow is a minimal hypervisor written in Rust
 
 Currently supports VM-exit handling, MSR interception, exception injection, and a synchronized EPT implementation.
 
