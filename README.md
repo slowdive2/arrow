@@ -12,6 +12,7 @@ The EPT subsystem currently identity-maps & derives memory-types from MTRRs, mai
 # Long term:
 - formal verification experiments
 - various stealth-based hooking techniques
+- debugging capabilities
 
 # References
 - https://revers.engineering/7-days-to-virtualization-a-series-on-hypervisor-development/
