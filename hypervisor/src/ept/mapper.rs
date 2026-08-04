@@ -4,25 +4,34 @@ use alloc::vec::Vec;
 use core::{ffi::c_void, mem::size_of, ptr};
 
 use bitfield_struct::bitfield;
-use x86::msr::{IA32_MTRRCAP, IA32_MTRR_PHYSBASE0, IA32_MTRR_PHYSMASK0};
-
-use wdk_sys::{
-    ntddk::{MmAllocateContiguousMemory, MmGetPhysicalAddress},
-    PAGED_CODE, PHYSICAL_ADDRESS,
+use x86::msr::{
+    IA32_MTRRCAP, IA32_MTRR_DEF_TYPE, IA32_MTRR_FIX16K_80000, IA32_MTRR_FIX16K_A0000,
+    IA32_MTRR_FIX4K_C0000, IA32_MTRR_FIX64K_00000, IA32_MTRR_PHYSBASE0, IA32_MTRR_PHYSMASK0,
 };
+
+#[cfg(not(test))]
+use wdk_sys::ntddk::MmGetPhysicalAddress;
+use wdk_sys::{ntddk::MmAllocateContiguousMemory, PAGED_CODE, PHYSICAL_ADDRESS};
 
 use super::{
     Ept2MbPageEntry, EptMemoryType, EptPageDirectory, EptPageDirectoryPointerTable,
-    EptPageMapLevel4, EptTableEntry, EPT_ENTRY_COUNT, EPT_LARGE_PAGE_SHIFT, EPT_LARGE_PAGE_SIZE,
-    EPT_PAGE_SHIFT, EPT_PAGE_SIZE,
+    EptPageMapLevel4, EptTableEntry, MtrrDefType, EPT_ENTRY_COUNT, EPT_LARGE_PAGE_SHIFT,
+    EPT_LARGE_PAGE_SIZE, EPT_PAGE_SHIFT, EPT_PAGE_SIZE,
 };
 use crate::support::rdmsr;
 
 pub(super) const EPT_TAG: u32 = u32::from_le_bytes(*b"tEpA");
 
 #[inline]
+#[cfg(not(test))]
 pub(super) unsafe fn phys_of(ptr: *mut c_void) -> u64 {
     unsafe { MmGetPhysicalAddress(ptr).QuadPart as u64 }
+}
+
+#[inline]
+#[cfg(test)]
+pub(super) unsafe fn phys_of(ptr: *mut c_void) -> u64 {
+    ptr as u64
 }
 
 // ia32_mtrrcap
@@ -73,6 +82,7 @@ pub struct MtrrRange {
     pub phys_base: u64,
     pub phys_end: u64,
     pub mem_type: u8,
+    pub fixed: bool,
 }
 
 #[repr(C, align(4096))]
@@ -90,7 +100,24 @@ const _: () = {
 
 pub fn build_mtrr_map() -> Vec<MtrrRange> {
     let cap = MtrrCap::from_bits(rdmsr(IA32_MTRRCAP));
-    let mut ranges = Vec::with_capacity(cap.var_count().into());
+    let def = MtrrDefType::from_bits(rdmsr(IA32_MTRR_DEF_TYPE));
+    let fixed_enabled = cap.fixed_supported() && def.fixed_enabled();
+    let fixed_count = if fixed_enabled { 88 } else { 0 };
+    let mut ranges = Vec::with_capacity(usize::from(cap.var_count()) + fixed_count);
+
+    if fixed_enabled {
+        push_fixed_ranges(&mut ranges, rdmsr(IA32_MTRR_FIX64K_00000), 0, 0x1_0000);
+        push_fixed_ranges(&mut ranges, rdmsr(IA32_MTRR_FIX16K_80000), 0x8_0000, 0x4000);
+        push_fixed_ranges(&mut ranges, rdmsr(IA32_MTRR_FIX16K_A0000), 0xa_0000, 0x4000);
+        for register in 0..8u32 {
+            push_fixed_ranges(
+                &mut ranges,
+                rdmsr(IA32_MTRR_FIX4K_C0000 + register),
+                0xc_0000 + u64::from(register) * 0x8000,
+                0x1000,
+            );
+        }
+    }
 
     for reg in 0..u32::from(cap.var_count()) {
         let off = reg * 2;
@@ -111,11 +138,24 @@ pub fn build_mtrr_map() -> Vec<MtrrRange> {
             phys_base,
             phys_end: phys_base + size - 1,
             mem_type: base.mem_type(),
+            fixed: false,
         });
     }
 
     log::debug!("committed {} MTRR ranges", ranges.len());
     ranges
+}
+
+fn push_fixed_ranges(ranges: &mut Vec<MtrrRange>, value: u64, start: u64, size: u64) {
+    for index in 0..8u64 {
+        let phys_base = start + index * size;
+        ranges.push(MtrrRange {
+            phys_base,
+            phys_end: phys_base + size - 1,
+            mem_type: ((value >> (index * 8)) & 0xff) as u8,
+            fixed: true,
+        });
+    }
 }
 
 // sdm 11.11.4.1 mtrr precedence
@@ -127,9 +167,14 @@ pub(super) fn mtrr_type(ranges: &[MtrrRange], default_type: u8, pa: u64) -> u8 {
 // check the whole leaf so a range in its middle is not missed
 fn mtrr_type_for_range(ranges: &[MtrrRange], default_type: u8, start: u64, end: u64) -> u8 {
     let mut kind = default_type;
+    let use_fixed = start < 0x10_0000
+        && ranges
+            .iter()
+            .any(|range| range.fixed && start <= range.phys_end && end >= range.phys_base);
 
     for range in ranges
         .iter()
+        .filter(|range| range.fixed == use_fixed)
         .filter(|range| start <= range.phys_end && end >= range.phys_base)
     {
         if range.mem_type == EptMemoryType::Uncacheable as u8 {
@@ -202,4 +247,36 @@ pub(super) unsafe fn alloc_map(mtrrs: &[MtrrRange], default_type: u8) -> *mut Ep
     }
 
     ptr::from_mut(ept)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_mtrr_wins_below_one_megabyte() {
+        let ranges = [
+            MtrrRange {
+                phys_base: 0,
+                phys_end: 0x1f_ffff,
+                mem_type: EptMemoryType::WriteBack as u8,
+                fixed: false,
+            },
+            MtrrRange {
+                phys_base: 0xa_0000,
+                phys_end: 0xb_ffff,
+                mem_type: EptMemoryType::Uncacheable as u8,
+                fixed: true,
+            },
+        ];
+
+        assert_eq!(
+            mtrr_type(&ranges, EptMemoryType::WriteBack as u8, 0xa_0000),
+            EptMemoryType::Uncacheable as u8,
+        );
+        assert_eq!(
+            mtrr_type(&ranges, EptMemoryType::Uncacheable as u8, 0x10_0000),
+            EptMemoryType::WriteBack as u8,
+        );
+    }
 }
