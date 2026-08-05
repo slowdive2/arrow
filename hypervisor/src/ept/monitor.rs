@@ -102,11 +102,11 @@ impl Ept {
             eptp,
             default_type,
             mtrrs: mtrrs.to_vec(),
-            free_pts: Vec::with_capacity(SPLIT_COUNT),
-            splits: Vec::with_capacity(SPLIT_COUNT),
+            free_pts: Vec::with_capacity(SPLIT_COUNT + 1),
+            splits: Vec::with_capacity(SPLIT_COUNT + 1),
         });
 
-        for _ in 0..SPLIT_COUNT {
+        for _ in 0..=SPLIT_COUNT {
             let pt = NonNull::new(unsafe {
                 ExAllocatePool2(POOL_FLAG_NON_PAGED, EPT_PAGE_SIZE as u64, EPT_TAG)
                     .cast::<EptPageTable>()
@@ -117,6 +117,11 @@ impl Ept {
                 return None;
             };
             ept.free_pts.push(pt);
+        }
+
+        if let Err(error) = ept.split_2mb(0) {
+            log::error!("failed to split the fixed-MTRR region: {error:?}");
+            return None;
         }
 
         Some(ept)
