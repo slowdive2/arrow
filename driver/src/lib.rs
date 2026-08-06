@@ -18,9 +18,8 @@ pub unsafe extern "system" fn driver_entry(
 ) -> NTSTATUS {
     hypervisor::logging::init(log::LevelFilter::Info);
 
-    driver.DriverUnload = Some(driver_exit);
-
     if unsafe { hypervisor::vmm::vmm_init() } {
+        driver.DriverUnload = Some(driver_exit);
         log::info!("vmm_init succeeded");
         STATUS_SUCCESS
     } else {
@@ -29,6 +28,12 @@ pub unsafe extern "system" fn driver_entry(
     }
 }
 
-extern "C" fn driver_exit(_driver: *mut DRIVER_OBJECT) {
+unsafe extern "C" fn driver_exit(_driver: *mut DRIVER_OBJECT) {
+    if !unsafe { hypervisor::vmm::vmm_shutdown() } {
+        log::error!("driver unload failed");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
     log::info!("driver unloading");
 }
