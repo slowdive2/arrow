@@ -35,7 +35,7 @@ pub fn handle(vcpu: &mut Vcpu) -> VmExitAction {
     let leaf = vcpu.regs.rax as u32;
     let subleaf = vcpu.regs.rcx as u32;
 
-    let mut cpuid_result = unsafe { __cpuid_count(leaf, subleaf) };
+    let mut cpuid_result = __cpuid_count(leaf, subleaf);
 
     if leaf == CpuidLeaf::FeatureInformation as u32 {
         cpuid_result
