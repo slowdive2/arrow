@@ -9,12 +9,14 @@
 // https://github.com/memN0ps/illusion-rs/blob/main/hypervisor/src/intel/vmlaunch.rs
 
 use {
-    crate::vmcs::GuestRegs,
+    crate::{vmcs::GuestRegs, vmm::Vcpu},
     core::{arch::global_asm, mem},
 };
 
 extern "efiapi" {
     pub fn launch_vm(regs: &mut GuestRegs, launched: u64) -> u64;
+    pub fn restore_guest(regs: &GuestRegs) -> !;
+    pub fn vmexit_entry();
 }
 
 global_asm!(
@@ -152,11 +154,6 @@ launch_vm:
     jmp     .VmEntryFailure
 
 .Launch:
-    mov     r14, 0x6C14 // vmcs_host_rsp
-    vmwrite r14, rsp
-    lea     r13, [rip + .VmExit]
-    mov     r14, 0x6C16 // vmcs_host_rip
-    vmwrite r14, r13
     mov     r13, [r15 + {registers_r13}]
     mov     r14, [r15 + {registers_r14}]
     mov     r15, [r15 + {registers_r15}]
@@ -165,8 +162,22 @@ launch_vm:
 .VmEntryFailure:
     jmp     .Exit
 
-.VmExit:
-    xchg    r15, [rsp]  // recover regs ptr and save guest r15
+.Exit:
+    pop     rax
+
+    RESTORE_XMM
+
+    POPAQ
+
+    pushfq
+    pop     rax
+    ret
+
+.global vmexit_entry
+vmexit_entry:
+    push    r15
+    mov     r15, [rsp + 8]
+    add     r15, {vcpu_regs}
     mov     [r15 + {registers_rax}], rax
     mov     [r15 + {registers_rbx}], rbx
     mov     [r15 + {registers_rcx}], rcx
@@ -199,18 +210,60 @@ launch_vm:
     movaps  [r15 + {registers_xmm14}], xmm14
     movaps  [r15 + {registers_xmm15}], xmm15
 
-    mov     rax, [rsp]  // guest r15
+    mov     rax, [rsp]
     mov     [r15 + {registers_r15}], rax
 
-.Exit:
-    pop     rax
+    sub     r15, {vcpu_regs}
+    mov     rcx, r15
+    sub     rsp, 0x20
+    call    vmexit_handler
+    int3
 
-    RESTORE_XMM
+.global restore_guest
+restore_guest:
+    mov     r15, rcx
 
-    POPAQ
+    mov     rax, [r15 + {registers_rsp}]
+    mov     rcx, [r15 + {registers_rip}]
+    mov     rdx, [r15 + {registers_rflags}]
+    mov     rsp, rax
+    push    rcx
+    push    rdx
 
-    pushfq
-    pop     rax
+    movaps  xmm0, [r15 + {registers_xmm0}]
+    movaps  xmm1, [r15 + {registers_xmm1}]
+    movaps  xmm2, [r15 + {registers_xmm2}]
+    movaps  xmm3, [r15 + {registers_xmm3}]
+    movaps  xmm4, [r15 + {registers_xmm4}]
+    movaps  xmm5, [r15 + {registers_xmm5}]
+    movaps  xmm6, [r15 + {registers_xmm6}]
+    movaps  xmm7, [r15 + {registers_xmm7}]
+    movaps  xmm8, [r15 + {registers_xmm8}]
+    movaps  xmm9, [r15 + {registers_xmm9}]
+    movaps  xmm10, [r15 + {registers_xmm10}]
+    movaps  xmm11, [r15 + {registers_xmm11}]
+    movaps  xmm12, [r15 + {registers_xmm12}]
+    movaps  xmm13, [r15 + {registers_xmm13}]
+    movaps  xmm14, [r15 + {registers_xmm14}]
+    movaps  xmm15, [r15 + {registers_xmm15}]
+
+    mov     rbx, [r15 + {registers_rbx}]
+    mov     rdx, [r15 + {registers_rdx}]
+    mov     rbp, [r15 + {registers_rbp}]
+    mov     rsi, [r15 + {registers_rsi}]
+    mov     rdi, [r15 + {registers_rdi}]
+    mov     r8,  [r15 + {registers_r8}]
+    mov     r9,  [r15 + {registers_r9}]
+    mov     r10, [r15 + {registers_r10}]
+    mov     r11, [r15 + {registers_r11}]
+    mov     r12, [r15 + {registers_r12}]
+    mov     r13, [r15 + {registers_r13}]
+    mov     r14, [r15 + {registers_r14}]
+
+    popfq
+    mov     rax, [r15 + {registers_rax}]
+    mov     rcx, [r15 + {registers_rcx}]
+    mov     r15, [r15 + {registers_r15}]
     ret
 "#,
     registers_rax = const mem::offset_of!(GuestRegs, rax),
@@ -228,6 +281,9 @@ launch_vm:
     registers_r13 = const mem::offset_of!(GuestRegs, r13),
     registers_r14 = const mem::offset_of!(GuestRegs, r14),
     registers_r15 = const mem::offset_of!(GuestRegs, r15),
+    registers_rsp = const mem::offset_of!(GuestRegs, rsp),
+    registers_rip = const mem::offset_of!(GuestRegs, rip),
+    registers_rflags = const mem::offset_of!(GuestRegs, rflags),
     registers_xmm0 = const mem::offset_of!(GuestRegs, xmm0),
     registers_xmm1 = const mem::offset_of!(GuestRegs, xmm1),
     registers_xmm2 = const mem::offset_of!(GuestRegs, xmm2),
@@ -244,4 +300,5 @@ launch_vm:
     registers_xmm13 = const mem::offset_of!(GuestRegs, xmm13),
     registers_xmm14 = const mem::offset_of!(GuestRegs, xmm14),
     registers_xmm15 = const mem::offset_of!(GuestRegs, xmm15),
+    vcpu_regs = const mem::offset_of!(Vcpu, regs),
 );

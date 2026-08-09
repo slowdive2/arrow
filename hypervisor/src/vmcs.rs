@@ -15,12 +15,14 @@ use x86::vmx::vmcs::{
 use x86::{
     bits64::rflags::RFlags,
     segmentation::{self, SegmentSelector},
+    vmx::Result as VmxResult,
 };
 
 use crate::{
     descriptor::Descriptors,
     support::{vmclear, vmptrld, vmwrite},
-    vmm::Vcpu,
+    vmlaunch::vmexit_entry,
+    vmm::{Vcpu, HOST_STACK_SIZE},
     vmx::{
         adjust_entry_controls, adjust_exit_controls, adjust_pinbased_controls,
         adjust_primary_controls, adjust_secondary_controls,
@@ -257,7 +259,7 @@ fn unusable_access_rights() -> u64 {
 fn host_selector(selector: SegmentSelector) -> u64 {
     u64::from(selector.bits() & !0x7)
 }
-pub unsafe fn setup_guest_state(guest_desc: &Descriptors, regs: &GuestRegs) {
+pub unsafe fn setup_guest_state(guest_desc: &Descriptors, regs: &GuestRegs) -> VmxResult<()> {
     let cs = segmentation::cs();
     let ss = segmentation::ss();
     let ds = segmentation::ds();
@@ -266,65 +268,67 @@ pub unsafe fn setup_guest_state(guest_desc: &Descriptors, regs: &GuestRegs) {
     let gs = segmentation::gs();
 
     unsafe {
-        vmwrite(vmcs::guest::CR0, x86::controlregs::cr0().bits() as u64);
-        vmwrite(vmcs::guest::CR3, x86::controlregs::cr3());
-        vmwrite(vmcs::guest::CR4, x86::controlregs::cr4().bits() as u64);
-        vmwrite(vmcs::guest::DR7, x86::debugregs::dr7().0 as u64);
+        vmwrite(vmcs::guest::CR0, x86::controlregs::cr0().bits() as u64)?;
+        vmwrite(vmcs::guest::CR3, x86::controlregs::cr3())?;
+        vmwrite(vmcs::guest::CR4, x86::controlregs::cr4().bits() as u64)?;
+        vmwrite(vmcs::guest::DR7, x86::debugregs::dr7().0 as u64)?;
 
-        vmwrite(vmcs::guest::RSP, regs.rsp);
-        vmwrite(vmcs::guest::RIP, regs.rip);
-        vmwrite(vmcs::guest::RFLAGS, regs.rflags);
+        vmwrite(vmcs::guest::RSP, regs.rsp)?;
+        vmwrite(vmcs::guest::RIP, regs.rip)?;
+        vmwrite(vmcs::guest::RFLAGS, regs.rflags)?;
 
-        vmwrite(vmcs::guest::CS_SELECTOR, u64::from(cs.bits()));
-        vmwrite(vmcs::guest::SS_SELECTOR, u64::from(ss.bits()));
-        vmwrite(vmcs::guest::DS_SELECTOR, u64::from(ds.bits()));
-        vmwrite(vmcs::guest::ES_SELECTOR, u64::from(es.bits()));
-        vmwrite(vmcs::guest::FS_SELECTOR, u64::from(fs.bits()));
-        vmwrite(vmcs::guest::GS_SELECTOR, u64::from(gs.bits()));
-        vmwrite(vmcs::guest::LDTR_SELECTOR, 0u64);
-        vmwrite(vmcs::guest::TR_SELECTOR, u64::from(guest_desc.tr.bits()));
+        vmwrite(vmcs::guest::CS_SELECTOR, u64::from(cs.bits()))?;
+        vmwrite(vmcs::guest::SS_SELECTOR, u64::from(ss.bits()))?;
+        vmwrite(vmcs::guest::DS_SELECTOR, u64::from(ds.bits()))?;
+        vmwrite(vmcs::guest::ES_SELECTOR, u64::from(es.bits()))?;
+        vmwrite(vmcs::guest::FS_SELECTOR, u64::from(fs.bits()))?;
+        vmwrite(vmcs::guest::GS_SELECTOR, u64::from(gs.bits()))?;
+        vmwrite(vmcs::guest::LDTR_SELECTOR, 0u64)?;
+        vmwrite(vmcs::guest::TR_SELECTOR, u64::from(guest_desc.tr.bits()))?;
 
-        vmwrite(vmcs::guest::CS_BASE, 0u64);
-        vmwrite(vmcs::guest::SS_BASE, 0u64);
-        vmwrite(vmcs::guest::DS_BASE, 0u64);
-        vmwrite(vmcs::guest::ES_BASE, 0u64);
+        vmwrite(vmcs::guest::CS_BASE, 0u64)?;
+        vmwrite(vmcs::guest::SS_BASE, 0u64)?;
+        vmwrite(vmcs::guest::DS_BASE, 0u64)?;
+        vmwrite(vmcs::guest::ES_BASE, 0u64)?;
 
         // long mode
-        vmwrite(vmcs::guest::FS_BASE, rdmsr(IA32_FS_BASE));
-        vmwrite(vmcs::guest::GS_BASE, rdmsr(IA32_GS_BASE));
+        vmwrite(vmcs::guest::FS_BASE, rdmsr(IA32_FS_BASE))?;
+        vmwrite(vmcs::guest::GS_BASE, rdmsr(IA32_GS_BASE))?;
 
-        vmwrite(vmcs::guest::LDTR_BASE, 0u64);
-        vmwrite(vmcs::guest::TR_BASE, guest_desc.tss_base);
+        vmwrite(vmcs::guest::LDTR_BASE, 0u64)?;
+        vmwrite(vmcs::guest::TR_BASE, guest_desc.tss_base)?;
 
-        vmwrite(vmcs::guest::CS_LIMIT, u64::from(lsl(cs)));
-        vmwrite(vmcs::guest::SS_LIMIT, u64::from(lsl(ss)));
-        vmwrite(vmcs::guest::DS_LIMIT, u64::from(lsl(ds)));
-        vmwrite(vmcs::guest::ES_LIMIT, u64::from(lsl(es)));
-        vmwrite(vmcs::guest::FS_LIMIT, u64::from(lsl(fs)));
-        vmwrite(vmcs::guest::GS_LIMIT, u64::from(lsl(gs)));
-        vmwrite(vmcs::guest::LDTR_LIMIT, 0u64);
-        vmwrite(vmcs::guest::TR_LIMIT, u64::from(guest_desc.tss_limit));
+        vmwrite(vmcs::guest::CS_LIMIT, u64::from(lsl(cs)))?;
+        vmwrite(vmcs::guest::SS_LIMIT, u64::from(lsl(ss)))?;
+        vmwrite(vmcs::guest::DS_LIMIT, u64::from(lsl(ds)))?;
+        vmwrite(vmcs::guest::ES_LIMIT, u64::from(lsl(es)))?;
+        vmwrite(vmcs::guest::FS_LIMIT, u64::from(lsl(fs)))?;
+        vmwrite(vmcs::guest::GS_LIMIT, u64::from(lsl(gs)))?;
+        vmwrite(vmcs::guest::LDTR_LIMIT, 0u64)?;
+        vmwrite(vmcs::guest::TR_LIMIT, u64::from(guest_desc.tss_limit))?;
 
-        vmwrite(vmcs::guest::CS_ACCESS_RIGHTS, vmcs_access_rights(cs));
-        vmwrite(vmcs::guest::SS_ACCESS_RIGHTS, vmcs_access_rights(ss));
-        vmwrite(vmcs::guest::DS_ACCESS_RIGHTS, vmcs_access_rights(ds));
-        vmwrite(vmcs::guest::ES_ACCESS_RIGHTS, vmcs_access_rights(es));
-        vmwrite(vmcs::guest::FS_ACCESS_RIGHTS, vmcs_access_rights(fs));
-        vmwrite(vmcs::guest::GS_ACCESS_RIGHTS, vmcs_access_rights(gs));
-        vmwrite(vmcs::guest::LDTR_ACCESS_RIGHTS, unusable_access_rights());
+        vmwrite(vmcs::guest::CS_ACCESS_RIGHTS, vmcs_access_rights(cs))?;
+        vmwrite(vmcs::guest::SS_ACCESS_RIGHTS, vmcs_access_rights(ss))?;
+        vmwrite(vmcs::guest::DS_ACCESS_RIGHTS, vmcs_access_rights(ds))?;
+        vmwrite(vmcs::guest::ES_ACCESS_RIGHTS, vmcs_access_rights(es))?;
+        vmwrite(vmcs::guest::FS_ACCESS_RIGHTS, vmcs_access_rights(fs))?;
+        vmwrite(vmcs::guest::GS_ACCESS_RIGHTS, vmcs_access_rights(gs))?;
+        vmwrite(vmcs::guest::LDTR_ACCESS_RIGHTS, unusable_access_rights())?;
         vmwrite(
             vmcs::guest::TR_ACCESS_RIGHTS,
             vmcs_access_rights(guest_desc.tr),
-        );
+        )?;
 
-        vmwrite(vmcs::guest::GDTR_BASE, guest_desc.gdtr.base as u64);
-        vmwrite(vmcs::guest::IDTR_BASE, guest_desc.idtr.base as u64);
-        vmwrite(vmcs::guest::GDTR_LIMIT, u64::from(guest_desc.gdtr.limit));
-        vmwrite(vmcs::guest::IDTR_LIMIT, u64::from(guest_desc.idtr.limit));
+        vmwrite(vmcs::guest::GDTR_BASE, guest_desc.gdtr.base as u64)?;
+        vmwrite(vmcs::guest::IDTR_BASE, guest_desc.idtr.base as u64)?;
+        vmwrite(vmcs::guest::GDTR_LIMIT, u64::from(guest_desc.gdtr.limit))?;
+        vmwrite(vmcs::guest::IDTR_LIMIT, u64::from(guest_desc.idtr.limit))?;
 
         // no shadow vmcs is linked
-        vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX);
+        vmwrite(vmcs::guest::LINK_PTR_FULL, u64::MAX)?;
     }
+
+    Ok(())
 }
 
 pub unsafe fn setup_host_state(
@@ -332,39 +336,42 @@ pub unsafe fn setup_host_state(
     host_cr3: u64,
     host_rsp: u64,
     host_rip: u64,
-) {
+) -> VmxResult<()> {
     unsafe {
-        vmwrite(vmcs::host::CR0, x86::controlregs::cr0().bits() as u64);
-        vmwrite(vmcs::host::CR3, host_cr3);
-        vmwrite(vmcs::host::CR4, x86::controlregs::cr4().bits() as u64);
+        vmwrite(vmcs::host::CR0, x86::controlregs::cr0().bits() as u64)?;
+        vmwrite(vmcs::host::CR3, host_cr3)?;
+        vmwrite(vmcs::host::CR4, x86::controlregs::cr4().bits() as u64)?;
 
-        vmwrite(vmcs::host::CS_SELECTOR, host_selector(segmentation::cs()));
-        vmwrite(vmcs::host::SS_SELECTOR, host_selector(segmentation::ss()));
-        vmwrite(vmcs::host::DS_SELECTOR, host_selector(segmentation::ds()));
-        vmwrite(vmcs::host::ES_SELECTOR, host_selector(segmentation::es()));
-        vmwrite(vmcs::host::FS_SELECTOR, host_selector(segmentation::fs()));
-        vmwrite(vmcs::host::GS_SELECTOR, host_selector(segmentation::gs()));
-        vmwrite(vmcs::host::TR_SELECTOR, host_selector(host_desc.tr));
+        vmwrite(vmcs::host::CS_SELECTOR, host_selector(segmentation::cs()))?;
+        vmwrite(vmcs::host::SS_SELECTOR, host_selector(segmentation::ss()))?;
+        vmwrite(vmcs::host::DS_SELECTOR, host_selector(segmentation::ds()))?;
+        vmwrite(vmcs::host::ES_SELECTOR, host_selector(segmentation::es()))?;
+        vmwrite(vmcs::host::FS_SELECTOR, host_selector(segmentation::fs()))?;
+        vmwrite(vmcs::host::GS_SELECTOR, host_selector(segmentation::gs()))?;
+        vmwrite(vmcs::host::TR_SELECTOR, host_selector(host_desc.tr))?;
 
-        vmwrite(vmcs::host::FS_BASE, rdmsr(IA32_FS_BASE));
-        vmwrite(vmcs::host::GS_BASE, rdmsr(IA32_GS_BASE));
-        vmwrite(vmcs::host::TR_BASE, host_desc.tss_base);
-        vmwrite(vmcs::host::GDTR_BASE, host_desc.gdtr.base as u64);
-        vmwrite(vmcs::host::IDTR_BASE, host_desc.idtr.base as u64);
+        vmwrite(vmcs::host::FS_BASE, rdmsr(IA32_FS_BASE))?;
+        vmwrite(vmcs::host::GS_BASE, rdmsr(IA32_GS_BASE))?;
+        vmwrite(vmcs::host::TR_BASE, host_desc.tss_base)?;
+        vmwrite(vmcs::host::GDTR_BASE, host_desc.gdtr.base as u64)?;
+        vmwrite(vmcs::host::IDTR_BASE, host_desc.idtr.base as u64)?;
 
-        vmwrite(vmcs::host::RSP, host_rsp);
-        vmwrite(vmcs::host::RIP, host_rip);
+        vmwrite(vmcs::host::RSP, host_rsp)?;
+        vmwrite(vmcs::host::RIP, host_rip)?;
     }
+
+    Ok(())
 }
 
 const PINBASED_CTL: u32 = 0;
-const PRIMARY_CTL: u32 = PrimaryControls::SECONDARY_CONTROLS.bits();
+const PRIMARY_CTL: u32 =
+    PrimaryControls::SECONDARY_CONTROLS.bits() | PrimaryControls::USE_MSR_BITMAPS.bits();
 const SECONDARY_CTL: u32 = SecondaryControls::ENABLE_EPT.bits();
 // both sides run in 64-bit mode
 const ENTRY_CTL: u32 = EntryControls::IA32E_MODE_GUEST.bits();
 const EXIT_CTL: u32 = ExitControls::HOST_ADDRESS_SPACE_SIZE.bits();
 
-pub unsafe fn setup_controls(vcpu: &mut Vcpu) -> bool {
+pub unsafe fn setup_controls(vcpu: &mut Vcpu) -> VmxResult<bool> {
     let pinbased = unsafe { adjust_pinbased_controls(PINBASED_CTL) };
     let primary = unsafe { adjust_primary_controls(PRIMARY_CTL) };
 
@@ -384,67 +391,75 @@ pub unsafe fn setup_controls(vcpu: &mut Vcpu) -> bool {
         || exit & EXIT_CTL != EXIT_CTL
     {
         log::error!("required EPT or VM-entry/VM-exit controls unavailable on this CPU");
-        return false;
+        return Ok(false);
     }
 
     if vcpu.ept.is_null() {
         log::error!("cannot enable EPT without shared EPT state");
-        return false;
+        return Ok(false);
     }
 
     unsafe {
-        vmwrite(vmcs::control::PINBASED_EXEC_CONTROLS, u64::from(pinbased));
+        vmwrite(vmcs::control::PINBASED_EXEC_CONTROLS, u64::from(pinbased))?;
         vmwrite(
             vmcs::control::PRIMARY_PROCBASED_EXEC_CONTROLS,
             u64::from(primary),
-        );
+        )?;
         vmwrite(
             vmcs::control::SECONDARY_PROCBASED_EXEC_CONTROLS,
             u64::from(secondary),
-        );
-        vmwrite(vmcs::control::VMENTRY_CONTROLS, u64::from(entry));
-        vmwrite(vmcs::control::VMEXIT_CONTROLS, u64::from(exit));
-        vmwrite(vmcs::control::MSR_BITMAPS_ADDR_FULL, vcpu.msr_bitmap_pa);
+        )?;
+        vmwrite(vmcs::control::VMENTRY_CONTROLS, u64::from(entry))?;
+        vmwrite(vmcs::control::VMEXIT_CONTROLS, u64::from(exit))?;
+        vmwrite(vmcs::control::MSR_BITMAPS_ADDR_FULL, vcpu.msr_bitmap_pa)?;
         // eptp cache type is for the tables, not mapped ram
-        vmwrite(vmcs::control::EPTP_FULL, (*vcpu.ept).eptp());
+        vmwrite(vmcs::control::EPTP_FULL, (*vcpu.ept).eptp())?;
 
-        vmwrite(vmcs::control::CR0_GUEST_HOST_MASK, 0u64);
-        vmwrite(vmcs::control::CR4_GUEST_HOST_MASK, 0u64);
+        vmwrite(vmcs::control::CR0_GUEST_HOST_MASK, 0u64)?;
+        vmwrite(vmcs::control::CR4_GUEST_HOST_MASK, 0u64)?;
         vmwrite(
             vmcs::control::CR0_READ_SHADOW,
             x86::controlregs::cr0().bits() as u64,
-        );
+        )?;
         vmwrite(
             vmcs::control::CR4_READ_SHADOW,
             x86::controlregs::cr4().bits() as u64,
-        );
+        )?;
 
-        vmwrite(vmcs::control::EXCEPTION_BITMAP, 0u64);
-        vmwrite(vmcs::control::PAGE_FAULT_ERR_CODE_MASK, 0u64);
-        vmwrite(vmcs::control::PAGE_FAULT_ERR_CODE_MATCH, 0u64);
-        vmwrite(vmcs::control::CR3_TARGET_COUNT, 0u64);
-        vmwrite(vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD, 0u64);
-        vmwrite(vmcs::control::VMENTRY_MSR_LOAD_COUNT, 0u64);
-        vmwrite(vmcs::control::VMEXIT_MSR_STORE_COUNT, 0u64);
-        vmwrite(vmcs::control::VMEXIT_MSR_LOAD_COUNT, 0u64);
+        vmwrite(vmcs::control::EXCEPTION_BITMAP, 0u64)?;
+        vmwrite(vmcs::control::PAGE_FAULT_ERR_CODE_MASK, 0u64)?;
+        vmwrite(vmcs::control::PAGE_FAULT_ERR_CODE_MATCH, 0u64)?;
+        vmwrite(vmcs::control::CR3_TARGET_COUNT, 0u64)?;
+        vmwrite(vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD, 0u64)?;
+        vmwrite(vmcs::control::VMENTRY_MSR_LOAD_COUNT, 0u64)?;
+        vmwrite(vmcs::control::VMEXIT_MSR_STORE_COUNT, 0u64)?;
+        vmwrite(vmcs::control::VMEXIT_MSR_LOAD_COUNT, 0u64)?;
     }
 
-    true
+    Ok(true)
 }
 
-pub unsafe fn setup_vmcs(vcpu: *mut Vcpu) -> bool {
+pub unsafe fn setup_vmcs(vcpu: *mut Vcpu) -> VmxResult<bool> {
     assert!(!vcpu.is_null(), "setup_vmcs received a null Vcpu pointer");
 
+    let vcpu_ptr = vcpu;
     let vcpu = unsafe { &mut *vcpu };
 
     unsafe {
-        vmclear(vcpu.vmcs_pa);
-        vmptrld(vcpu.vmcs_pa);
+        vmclear(vcpu.vmcs_pa)?;
+        vmptrld(vcpu.vmcs_pa)?;
 
-        setup_guest_state(&vcpu.guest_desc, &vcpu.regs);
+        setup_guest_state(&vcpu.guest_desc, &vcpu.regs)?;
 
-        // launch_vm fills host rsp/rip right before vmlaunch
-        setup_host_state(&vcpu.host_desc, x86::controlregs::cr3(), 0, 0);
+        let host_top = vcpu.host_stack.add(HOST_STACK_SIZE) as usize & !0xf;
+        let host_rsp = host_top - mem::size_of::<*mut Vcpu>();
+        *(host_rsp as *mut *mut Vcpu) = vcpu_ptr;
+        setup_host_state(
+            &vcpu.host_desc,
+            x86::controlregs::cr3(),
+            host_rsp as u64,
+            vmexit_entry as *const () as usize as u64,
+        )?;
 
         setup_controls(vcpu)
     }

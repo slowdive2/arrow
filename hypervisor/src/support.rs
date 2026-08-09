@@ -12,41 +12,35 @@
 use core::arch::asm;
 use wdk_sys::ntddk::KeIpiGenericCall;
 
-pub fn vmxon(vmxon_region: u64) {
-    unsafe { x86::bits64::vmx::vmxon(vmxon_region).unwrap() };
+pub fn vmxon(vmxon_region: u64) -> x86::vmx::Result<()> {
+    unsafe { x86::bits64::vmx::vmxon(vmxon_region) }
 }
 
-pub fn vmxoff() -> bool {
-    match unsafe { x86::bits64::vmx::vmxoff() } {
-        Ok(()) => true,
-        Err(_) => {
-            log::error!("VMXOFF failed");
-            false
-        }
-    }
+pub fn vmxoff() -> x86::vmx::Result<()> {
+    unsafe { x86::bits64::vmx::vmxoff() }
 }
 
-pub fn vmclear(vmcs_region: u64) {
-    unsafe { x86::bits64::vmx::vmclear(vmcs_region).unwrap() };
+pub fn vmclear(vmcs_region: u64) -> x86::vmx::Result<()> {
+    unsafe { x86::bits64::vmx::vmclear(vmcs_region) }
 }
 
-pub fn vmptrld(vmcs_region: u64) {
-    unsafe { x86::bits64::vmx::vmptrld(vmcs_region).unwrap() }
+pub fn vmptrld(vmcs_region: u64) -> x86::vmx::Result<()> {
+    unsafe { x86::bits64::vmx::vmptrld(vmcs_region) }
 }
 
-pub fn vmptrst() -> u64 {
-    unsafe { x86::bits64::vmx::vmptrst().unwrap() }
+pub fn vmptrst() -> x86::vmx::Result<u64> {
+    unsafe { x86::bits64::vmx::vmptrst() }
 }
 
-pub fn vmread(field: u32) -> u64 {
-    unsafe { x86::bits64::vmx::vmread(field) }.unwrap_or(0)
+pub fn vmread(field: u32) -> x86::vmx::Result<u64> {
+    unsafe { x86::bits64::vmx::vmread(field) }
 }
 
-pub fn vmwrite<T: Into<u64>>(field: u32, val: T)
+pub fn vmwrite<T: Into<u64>>(field: u32, val: T) -> x86::vmx::Result<()>
 where
     u64: From<T>,
 {
-    unsafe { x86::bits64::vmx::vmwrite(field, u64::from(val)) }.unwrap();
+    unsafe { x86::bits64::vmx::vmwrite(field, u64::from(val)) }
 }
 
 unsafe fn vmcall_watch_exec_here(gpa: u64) -> bool {
@@ -119,6 +113,10 @@ pub fn cr3() -> u64 {
     unsafe { x86::controlregs::cr3() }
 }
 
+pub fn cr3_write(val: u64) {
+    unsafe { x86::controlregs::cr3_write(val) };
+}
+
 pub fn cr4() -> u64 {
     unsafe { x86::controlregs::cr4() }.bits() as u64
 }
@@ -127,16 +125,32 @@ pub fn cr4_write(val: u64) {
     unsafe { x86::controlregs::cr4_write(x86::controlregs::Cr4::from_bits_truncate(val as usize)) };
 }
 
-pub fn guest_cr0() -> u64 {
-    let mask = vmread(x86::vmx::vmcs::control::CR0_GUEST_HOST_MASK);
-    vmread(x86::vmx::vmcs::control::CR0_READ_SHADOW) & mask
-        | vmread(x86::vmx::vmcs::guest::CR0) & !mask
+pub fn guest_cr0() -> x86::vmx::Result<u64> {
+    let mask = vmread(x86::vmx::vmcs::control::CR0_GUEST_HOST_MASK)?;
+    Ok(vmread(x86::vmx::vmcs::control::CR0_READ_SHADOW)? & mask
+        | vmread(x86::vmx::vmcs::guest::CR0)? & !mask)
 }
 
-pub fn guest_cr4() -> u64 {
-    let mask = vmread(x86::vmx::vmcs::control::CR4_GUEST_HOST_MASK);
-    vmread(x86::vmx::vmcs::control::CR4_READ_SHADOW) & mask
-        | vmread(x86::vmx::vmcs::guest::CR4) & !mask
+pub unsafe fn vmcall_shutdown() -> bool {
+    use crate::exit::vmcall::{ARROW_HYPERCALL_MAGIC, HYPERCALL_SHUTDOWN};
+
+    let status: u64;
+    unsafe {
+        asm!(
+            "vmcall",
+            in("rcx") HYPERCALL_SHUTDOWN,
+            in("r10") ARROW_HYPERCALL_MAGIC,
+            lateout("rax") status,
+            options(nostack),
+        );
+    }
+    status == 0
+}
+
+pub fn guest_cr4() -> x86::vmx::Result<u64> {
+    let mask = vmread(x86::vmx::vmcs::control::CR4_GUEST_HOST_MASK)?;
+    Ok(vmread(x86::vmx::vmcs::control::CR4_READ_SHADOW)? & mask
+        | vmread(x86::vmx::vmcs::guest::CR4)? & !mask)
 }
 
 pub fn cr2_write(val: u64) {
@@ -186,6 +200,10 @@ pub fn dr6_read() -> u64 {
 
 pub fn dr7_read() -> u64 {
     unsafe { x86::debugregs::dr7().0 as u64 }
+}
+
+pub fn dr7_write(val: u64) {
+    unsafe { x86::debugregs::dr7_write(x86::debugregs::Dr7(val as usize)) };
 }
 
 // disable maskable interrupts

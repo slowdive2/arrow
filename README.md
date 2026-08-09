@@ -14,6 +14,18 @@ The EPT subsystem currently identity-maps & derives memory-types from MTRRs, mai
 - various stealth-based hooking techniques
 - debugging capabilities
 
+# Build
+
+64-bit Windows with the MSVC Rust toolchain, Visual Studio Build Tools, Windows SDK, and the matching Windows Driver Kit. The WDK installation must include the kernel-mode `km` headers
+
+```powershell
+rustup component add rustfmt
+cargo fmt --all -- --check
+cargo check --workspace
+cargo test -p hypervisor --lib
+```
+
+
 # References
 - https://revers.engineering/7-days-to-virtualization-a-series-on-hypervisor-development/
 - https://github.com/memN0ps/illusion-rs

@@ -6,6 +6,7 @@ use super::vmexit::VmExitAction;
 
 pub const ARROW_HYPERCALL_MAGIC: u64 = u64::from_le_bytes(*b"ArrowEPT");
 pub const HYPERCALL_ARM_EXECUTE_MONITOR: u64 = 1;
+pub const HYPERCALL_SHUTDOWN: u64 = 2;
 
 const HYPERCALL_SUCCESS: u64 = 0;
 const HYPERCALL_ERROR: u64 = u64::MAX;
@@ -14,6 +15,11 @@ const HYPERCALL_ERROR: u64 = u64::MAX;
 pub unsafe fn handle(vcpu: &mut Vcpu) -> Option<VmExitAction> {
     if vcpu.regs.r10 != ARROW_HYPERCALL_MAGIC {
         return None;
+    }
+
+    if vcpu.regs.rcx == HYPERCALL_SHUTDOWN {
+        vcpu.regs.rax = HYPERCALL_SUCCESS;
+        return Some(VmExitAction::ShutdownAndAdvance);
     }
 
     let result = match vcpu.regs.rcx {

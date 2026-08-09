@@ -1,0 +1,13 @@
+name: Formatting
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rustfmt:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt
+      - run: cargo fmt --all -- --check

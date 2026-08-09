@@ -16,14 +16,8 @@ pub struct VmxRegion {
 }
 
 pub fn has_vmx_support() -> bool {
-    let result = unsafe { __cpuid(1) };
+    let result = __cpuid(1);
     result.ecx & (1 << 5) != 0
-}
-
-pub fn vmxon(vmxon_region: u64) {
-    unsafe {
-        x86::bits64::vmx::vmxon(vmxon_region).unwrap();
-    }
 }
 
 pub unsafe fn adjust_control_regs() {

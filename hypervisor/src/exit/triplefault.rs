@@ -40,15 +40,18 @@ pub unsafe fn reset() -> ! {
 }
 
 fn dump_vcpu_state(vcpu: &Vcpu) {
-    log::error!(
-        "triple fault: rip={:#x} rsp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}",
-        vmread(vmcs::guest::RIP),
-        vmread(vmcs::guest::RSP),
-        vcpu.regs.rax,
-        vcpu.regs.rbx,
-        vcpu.regs.rcx,
-        vcpu.regs.rdx,
-    );
+    match (vmread(vmcs::guest::RIP), vmread(vmcs::guest::RSP)) {
+        (Ok(rip), Ok(rsp)) => log::error!(
+            "triple fault: rip={:#x} rsp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x}",
+            rip,
+            rsp,
+            vcpu.regs.rax,
+            vcpu.regs.rbx,
+            vcpu.regs.rcx,
+            vcpu.regs.rdx,
+        ),
+        (rip, rsp) => log::error!("triple fault: VMCS read failed: rip={rip:?} rsp={rsp:?}"),
+    }
 }
 
 pub unsafe fn handle(vcpu: &Vcpu) -> ! {

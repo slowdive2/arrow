@@ -4,7 +4,7 @@ use x86::vmx::vmcs;
 
 use super::{cpuid, ept, genericvmx, msr, triplefault, vmcall};
 
-const VM_ENTRY_FAILED: u64 = 0x41; // cf | zf, intel sdm 31.2 "conventions"
+pub const VM_ENTRY_FAILED: u64 = 0x41; // cf | zf, intel sdm 31.2 "conventions"
 
 // intel sdm appendix c, table c-1 "basic exit reasons"
 mod exit_reason {
@@ -34,26 +34,83 @@ pub enum VmExitAction {
     ResumeAndAdvance,
     ResumeWithoutAdvance,
     Shutdown,
+    ShutdownAndAdvance,
 }
 
-fn advance_rip() {
-    let rip = vmread(vmcs::guest::RIP);
-    let len = vmread(vmcs::ro::VMEXIT_INSTRUCTION_LEN);
-    vmwrite(vmcs::guest::RIP, rip + len);
+fn read_vmcs(field: u32) -> Option<u64> {
+    match vmread(field) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            log::error!("vmread failed for field {field:#x}: {error:?}");
+            None
+        }
+    }
+}
+
+fn refresh_guest_state(vcpu: &mut Vcpu) -> bool {
+    let state = (
+        read_vmcs(vmcs::guest::RIP),
+        read_vmcs(vmcs::guest::RSP),
+        read_vmcs(vmcs::guest::RFLAGS),
+    );
+
+    let (Some(rip), Some(rsp), Some(rflags)) = state else {
+        return false;
+    };
+
+    vcpu.regs.rip = rip;
+    vcpu.regs.rsp = rsp;
+    vcpu.regs.rflags = rflags;
+    true
+}
+
+fn advance_rip(vcpu: &mut Vcpu) -> bool {
+    let Some(len) = read_vmcs(vmcs::ro::VMEXIT_INSTRUCTION_LEN) else {
+        return false;
+    };
+    let Some(next_rip) = vcpu.regs.rip.checked_add(len) else {
+        log::error!("guest RIP overflow while advancing by {len}");
+        return false;
+    };
+
+    match vmwrite(vmcs::guest::RIP, next_rip) {
+        Ok(()) => {
+            vcpu.regs.rip = next_rip;
+            true
+        }
+        Err(error) => {
+            log::error!("vmwrite failed for guest RIP: {error:?}");
+            false
+        }
+    }
 }
 
 pub unsafe fn handle(rflags: u64, vcpu: &mut Vcpu) -> VmExitAction {
     if rflags & VM_ENTRY_FAILED != 0 {
-        log::error!(
-            "vmlaunch failed: rflags={:#x} vm-instruction-error={:#x}",
-            rflags,
-            vmread(vmcs::ro::VM_INSTRUCTION_ERROR),
-        );
+        match vmread(vmcs::ro::VM_INSTRUCTION_ERROR) {
+            Ok(error) => log::error!(
+                "vmlaunch failed: rflags={:#x} vm-instruction-error={:#x}",
+                rflags,
+                error,
+            ),
+            Err(error) => log::error!(
+                "vmlaunch failed: rflags={:#x} vmread failed: {error:?}",
+                rflags,
+            ),
+        }
         return VmExitAction::Shutdown;
     }
 
-    let reason = vmread(vmcs::ro::EXIT_REASON) & 0xffff;
-    let qual = vmread(vmcs::ro::EXIT_QUALIFICATION);
+    let Some(reason) = read_vmcs(vmcs::ro::EXIT_REASON) else {
+        return VmExitAction::Shutdown;
+    };
+    let reason = reason & 0xffff;
+    let Some(qual) = read_vmcs(vmcs::ro::EXIT_QUALIFICATION) else {
+        return VmExitAction::Shutdown;
+    };
+    if !refresh_guest_state(vcpu) {
+        return VmExitAction::Shutdown;
+    }
 
     let action = match reason {
         exit_reason::CPUID => cpuid::handle(vcpu),
@@ -61,10 +118,16 @@ pub unsafe fn handle(rflags: u64, vcpu: &mut Vcpu) -> VmExitAction {
         exit_reason::WRMSR => unsafe { msr::handle(vcpu, true) },
         exit_reason::TRIPLE_FAULT => unsafe { triplefault::handle(vcpu) },
         exit_reason::EPT_VIOLATION => unsafe {
-            ept::handle_violation(vcpu, qual, vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL))
+            let Some(gpa) = read_vmcs(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL) else {
+                return VmExitAction::Shutdown;
+            };
+            ept::handle_violation(vcpu, qual, gpa)
         },
         exit_reason::EPT_MISCONFIGURATION => {
-            ept::handle_misconfig(vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL))
+            let Some(gpa) = read_vmcs(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL) else {
+                return VmExitAction::Shutdown;
+            };
+            ept::handle_misconfig(gpa)
         }
         exit_reason::VMCALL => unsafe {
             vmcall::handle(vcpu).unwrap_or_else(|| genericvmx::handle(vcpu))
@@ -87,9 +150,19 @@ pub unsafe fn handle(rflags: u64, vcpu: &mut Vcpu) -> VmExitAction {
         }
     };
 
-    if action == VmExitAction::ResumeAndAdvance {
-        advance_rip();
+    if matches!(
+        action,
+        VmExitAction::ResumeAndAdvance | VmExitAction::ShutdownAndAdvance
+    ) && !advance_rip(vcpu)
+    {
+        log::error!("cannot safely resume or devirtualize without advancing guest RIP");
+        loop {
+            core::hint::spin_loop();
+        }
     }
 
-    action
+    match action {
+        VmExitAction::ShutdownAndAdvance => VmExitAction::Shutdown,
+        _ => action,
+    }
 }

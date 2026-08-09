@@ -52,42 +52,50 @@ impl VmEntryEvent {
     }
 }
 
-unsafe fn inject_exception(vcpu: &mut Vcpu, event: VmEntryEvent) {
-    unsafe {
-        vmwrite(
-            vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
-            u64::from(event.interruption_info()),
-        );
-        vmwrite(vmcs::control::VMENTRY_INSTRUCTION_LEN, 0u64);
+unsafe fn inject_exception(vcpu: &mut Vcpu, event: VmEntryEvent) -> x86::vmx::Result<()> {
+    vmwrite(
+        vmcs::control::VMENTRY_INTERRUPTION_INFO_FIELD,
+        u64::from(event.interruption_info()),
+    )?;
+    vmwrite(vmcs::control::VMENTRY_INSTRUCTION_LEN, 0u64)?;
 
-        if let Some(error_code) = event.error_code {
-            vmwrite(
-                vmcs::control::VMENTRY_EXCEPTION_ERR_CODE,
-                u64::from(error_code),
-            );
-        }
+    if let Some(error_code) = event.error_code {
+        vmwrite(
+            vmcs::control::VMENTRY_EXCEPTION_ERR_CODE,
+            u64::from(error_code),
+        )?;
     }
 
     // rf avoids retriggering the same fault on entry
     // https://revers.engineering/day-5-vmexits-interrupts-cpuid-emulation/
     vcpu.regs.rflags.set_bit(RFLAGS_RF_BIT, true);
-    unsafe {
-        vmwrite(vmcs::guest::RFLAGS, vcpu.regs.rflags);
-    }
+    vmwrite(vmcs::guest::RFLAGS, vcpu.regs.rflags)?;
+
+    Ok(())
 }
 
 pub unsafe fn inject_ud(vcpu: &mut Vcpu) -> VmExitAction {
     // make the instruction look unsupported
-    unsafe { inject_exception(vcpu, VmEntryEvent::exception(VECTOR_INVALID_OPCODE, None)) };
-    VmExitAction::ResumeWithoutAdvance
+    match unsafe { inject_exception(vcpu, VmEntryEvent::exception(VECTOR_INVALID_OPCODE, None)) } {
+        Ok(()) => VmExitAction::ResumeWithoutAdvance,
+        Err(error) => {
+            log::error!("failed to inject #UD: {error:?}");
+            VmExitAction::Shutdown
+        }
+    }
 }
 
 pub unsafe fn inject_gp(vcpu: &mut Vcpu) -> VmExitAction {
-    unsafe {
+    match unsafe {
         inject_exception(
             vcpu,
             VmEntryEvent::exception(VECTOR_GENERAL_PROTECTION, Some(0)),
         )
-    };
-    VmExitAction::ResumeWithoutAdvance
+    } {
+        Ok(()) => VmExitAction::ResumeWithoutAdvance,
+        Err(error) => {
+            log::error!("failed to inject #GP: {error:?}");
+            VmExitAction::Shutdown
+        }
+    }
 }
