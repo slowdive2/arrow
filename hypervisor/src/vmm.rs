@@ -8,20 +8,21 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use wdk_sys::{
     ntddk::{
-        ExAllocatePool2, ExFreePoolWithTag, KeGetProcessorNumberFromIndex,
-        KeQueryActiveProcessorCountEx, KeRevertToUserGroupAffinityThread,
-        KeSetSystemGroupAffinityThread, MmGetPhysicalAddress,
+        ExAllocatePool2, ExFreePoolWithTag, KeGetCurrentProcessorNumberEx,
+        KeGetProcessorNumberFromIndex, KeQueryActiveProcessorCountEx,
+        KeRevertToUserGroupAffinityThread, KeSetSystemGroupAffinityThread, MmGetPhysicalAddress,
     },
     GROUP_AFFINITY, KAFFINITY, POOL_FLAG_NON_PAGED, PROCESSOR_NUMBER,
 };
 
-use x86::msr::{rdmsr, IA32_VMX_BASIC};
+use x86::msr::{rdmsr, IA32_SYSENTER_CS, IA32_SYSENTER_EIP, IA32_SYSENTER_ESP, IA32_VMX_BASIC};
 
 use crate::descriptor::Descriptors;
 use crate::ept::{build_mtrr_map, ept_supported, mtrr_default_type, Ept};
 use crate::exit::vmexit::{handle, VmExitAction, VM_ENTRY_FAILED};
 use crate::support::{
     cr0, cr0_write, cr3_write, cr4, cr4_write, dr7_write, vmcall_shutdown, vmread, vmxoff, vmxon,
+    wrmsr,
 };
 use crate::vmcs::{capture_registers, setup_vmcs, GuestRegs};
 use crate::vmlaunch::{launch_vm, restore_guest};
@@ -62,6 +63,8 @@ pub struct Vcpu {
     pub host_desc: Descriptors,
     original_cr0: u64,
     original_cr4: u64,
+    processor_group: u16,
+    processor_number: u8,
     // True while lifecycle cleanup must obtain a successful VMXOFF before
     // freeing any allocation reachable through this vCPU's VMCS.
     active: AtomicBool,
@@ -83,6 +86,8 @@ pub struct Vmm {
 
 static VMM: AtomicPtr<Vmm> = AtomicPtr::new(null_mut());
 static VMM_LIFECYCLE_LOCK: AtomicBool = AtomicBool::new(false);
+static VMM_ACCEPTING_CLIENTS: AtomicBool = AtomicBool::new(false);
+static VMM_CLIENTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 struct VmmLifecycleGuard;
 
@@ -99,6 +104,56 @@ impl Drop for VmmLifecycleGuard {
     fn drop(&mut self) {
         VMM_LIFECYCLE_LOCK.store(false, Ordering::Release);
     }
+}
+
+pub(crate) struct VmmClientGuard;
+
+impl VmmClientGuard {
+    pub(crate) fn try_acquire() -> Option<Self> {
+        if !VMM_ACCEPTING_CLIENTS.load(Ordering::Acquire) {
+            return None;
+        }
+
+        VMM_CLIENTS.fetch_add(1, Ordering::AcqRel);
+        if VMM_ACCEPTING_CLIENTS.load(Ordering::Acquire) && !VMM.load(Ordering::Acquire).is_null() {
+            Some(Self)
+        } else {
+            VMM_CLIENTS.fetch_sub(1, Ordering::AcqRel);
+            None
+        }
+    }
+}
+
+impl Drop for VmmClientGuard {
+    fn drop(&mut self) {
+        VMM_CLIENTS.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Returns whether the current logical processor has an active vCPU.
+///
+/// A `VmmClientGuard` must be held by the caller while this function runs so
+/// the published VMM and its vCPU table cannot be freed concurrently.
+pub(crate) unsafe fn current_cpu_virtualized(_guard: &VmmClientGuard) -> bool {
+    let ctx = VMM.load(Ordering::Acquire);
+    if ctx.is_null() {
+        return false;
+    }
+
+    let mut current = unsafe { core::mem::zeroed::<PROCESSOR_NUMBER>() };
+    unsafe { KeGetCurrentProcessorNumberEx(&mut current) };
+
+    for i in 0..unsafe { (*ctx).cpu_count } {
+        let vcpu = unsafe { *(*ctx).vcpus.add(i as usize) };
+        if !vcpu.is_null()
+            && unsafe { (*vcpu).processor_group == current.Group }
+            && unsafe { (*vcpu).processor_number == current.Number }
+        {
+            return unsafe { (*vcpu).active.load(Ordering::Acquire) };
+        }
+    }
+
+    false
 }
 
 pub unsafe fn init_vmxon(vcpu: *mut Vcpu) -> bool {
@@ -287,7 +342,7 @@ unsafe fn free_vmm(ctx: *mut Vmm) {
     }
 }
 
-unsafe fn switch_to_processor(index: u32) -> Option<GROUP_AFFINITY> {
+unsafe fn switch_to_processor(index: u32) -> Option<(GROUP_AFFINITY, PROCESSOR_NUMBER)> {
     let mut cpu_num = unsafe { core::mem::zeroed::<PROCESSOR_NUMBER>() };
     if unsafe { KeGetProcessorNumberFromIndex(index, &mut cpu_num) } < 0 {
         log::error!("cannot find processor {}", index);
@@ -299,7 +354,16 @@ unsafe fn switch_to_processor(index: u32) -> Option<GROUP_AFFINITY> {
     affinity.Group = cpu_num.Group;
     affinity.Mask = (1 as KAFFINITY) << cpu_num.Number;
     unsafe { KeSetSystemGroupAffinityThread(&affinity, &mut old_affinity) };
-    Some(old_affinity)
+    Some((old_affinity, cpu_num))
+}
+
+unsafe fn switch_to_vcpu(vcpu: *mut Vcpu) -> GROUP_AFFINITY {
+    let mut affinity = unsafe { core::mem::zeroed::<GROUP_AFFINITY>() };
+    let mut old_affinity = unsafe { core::mem::zeroed::<GROUP_AFFINITY>() };
+    affinity.Group = unsafe { (*vcpu).processor_group };
+    affinity.Mask = (1 as KAFFINITY) << unsafe { (*vcpu).processor_number };
+    unsafe { KeSetSystemGroupAffinityThread(&affinity, &mut old_affinity) };
+    old_affinity
 }
 
 unsafe fn shutdown_vcpu(ctx: *mut Vmm, index: u32) -> bool {
@@ -308,9 +372,7 @@ unsafe fn shutdown_vcpu(ctx: *mut Vmm, index: u32) -> bool {
         return true;
     }
 
-    let Some(old_affinity) = (unsafe { switch_to_processor(index) }) else {
-        return false;
-    };
+    let old_affinity = unsafe { switch_to_vcpu(vcpu) };
     let ok = unsafe { vmcall_shutdown() };
     unsafe { KeRevertToUserGroupAffinityThread(&old_affinity) };
 
@@ -326,9 +388,9 @@ unsafe fn shutdown_all(ctx: *mut Vmm) -> bool {
 }
 
 unsafe fn rollback(ctx: *mut Vmm) {
-    if !unsafe { shutdown_all(ctx) } {
-        log::error!("rollback failed");
-        loop {
+    while !unsafe { shutdown_all(ctx) } {
+        log::error!("rollback incomplete; retrying");
+        for _ in 0..1024 {
             core::hint::spin_loop();
         }
     }
@@ -348,6 +410,11 @@ pub unsafe fn vmm_shutdown() -> bool {
         return false;
     };
 
+    VMM_ACCEPTING_CLIENTS.store(false, Ordering::Release);
+    while VMM_CLIENTS.load(Ordering::Acquire) != 0 {
+        core::hint::spin_loop();
+    }
+
     let ctx = VMM.load(Ordering::Acquire);
     if ctx.is_null() {
         return true;
@@ -355,6 +422,7 @@ pub unsafe fn vmm_shutdown() -> bool {
 
     if !unsafe { shutdown_all(ctx) } {
         log::error!("failed to stop every virtual processor");
+        VMM_ACCEPTING_CLIENTS.store(true, Ordering::Release);
         return false;
     }
 
@@ -363,7 +431,9 @@ pub unsafe fn vmm_shutdown() -> bool {
     true
 }
 
-/// Allocates and launches the VMM on every active logical processor.
+/// Allocates and launches the VMM on every logical processor active in the
+/// startup snapshot. Later-added processors remain native and are skipped by
+/// cross-CPU hypercalls.
 ///
 /// # Safety
 ///
@@ -386,7 +456,9 @@ pub unsafe fn vmm_init() -> bool {
     }
 
     // firmware keeps mtrrs in sync, so read them once
-    let mtrrs = build_mtrr_map();
+    let Some(mtrrs) = build_mtrr_map() else {
+        return false;
+    };
     let default_type = mtrr_default_type();
     // this needs special consideration.. lifecycle is roughly:
     // ept::new -> box::into_raw to avoid destruction -> ... free_ept..box::from_raw MANUALLY reconstructs to free
@@ -423,11 +495,15 @@ pub unsafe fn vmm_init() -> bool {
 
     // then enter vmx on each cpu
     for i in 0..cpu_count {
-        let Some(old_affinity) = (unsafe { switch_to_processor(i) }) else {
+        let Some((old_affinity, cpu_num)) = (unsafe { switch_to_processor(i) }) else {
             unsafe { rollback(ctx) };
             return false;
         };
         let vcpu = unsafe { *(*ctx).vcpus.add(i as usize) };
+        unsafe {
+            (*vcpu).processor_group = cpu_num.Group;
+            (*vcpu).processor_number = cpu_num.Number;
+        }
         let ok = unsafe { init_cpu(vcpu, i) };
         unsafe { KeRevertToUserGroupAffinityThread(&old_affinity) };
 
@@ -439,6 +515,7 @@ pub unsafe fn vmm_init() -> bool {
     }
 
     VMM.store(ctx, Ordering::Release);
+    VMM_ACCEPTING_CLIENTS.store(true, Ordering::Release);
     true
 }
 
@@ -460,12 +537,46 @@ unsafe fn stop_cpu(vcpu: *mut Vcpu) -> ! {
         vmread(vmcs::guest::CR3),
         vmread(vmcs::guest::CR4),
         vmread(vmcs::guest::DR7),
+        vmread(vmcs::guest::IA32_SYSENTER_CS),
+        vmread(vmcs::guest::IA32_SYSENTER_ESP),
+        vmread(vmcs::guest::IA32_SYSENTER_EIP),
     );
 
-    let (rip, rsp, rflags, guest_cr0, guest_cr3, guest_cr4, guest_dr7) = match state {
-        (Ok(rip), Ok(rsp), Ok(rflags), Ok(cr0), Ok(cr3), Ok(cr4), Ok(dr7)) => {
-            (rip, rsp, rflags, cr0, cr3, cr4, dr7)
-        }
+    let (
+        rip,
+        rsp,
+        rflags,
+        guest_cr0,
+        guest_cr3,
+        guest_cr4,
+        guest_dr7,
+        guest_sysenter_cs,
+        guest_sysenter_esp,
+        guest_sysenter_eip,
+    ) = match state {
+        (
+            Ok(rip),
+            Ok(rsp),
+            Ok(rflags),
+            Ok(cr0),
+            Ok(cr3),
+            Ok(cr4),
+            Ok(dr7),
+            Ok(sysenter_cs),
+            Ok(sysenter_esp),
+            Ok(sysenter_eip),
+        ) => (
+            rip,
+            rsp,
+            rflags,
+            cr0,
+            cr3,
+            cr4,
+            dr7,
+            sysenter_cs,
+            sysenter_esp,
+            sysenter_eip,
+        ),
         error => {
             log::error!("failed to read guest state during shutdown: {error:?}");
             loop {
@@ -487,6 +598,9 @@ unsafe fn stop_cpu(vcpu: *mut Vcpu) -> ! {
     unsafe { (*vcpu).active.store(false, Ordering::Release) };
 
     unsafe {
+        wrmsr(IA32_SYSENTER_CS, guest_sysenter_cs);
+        wrmsr(IA32_SYSENTER_ESP, guest_sysenter_esp);
+        wrmsr(IA32_SYSENTER_EIP, guest_sysenter_eip);
         cr0_write(guest_cr0);
         cr3_write(guest_cr3);
         cr4_write((guest_cr4 & !(1 << 13)) | ((*vcpu).original_cr4 & (1 << 13)));
@@ -552,10 +666,7 @@ pub unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> bool {
 
     log::info!("vcpu {:p} in VMX operation on processor {}", vcpu, cpu);
 
-    if unsafe { capture_registers(&mut (*vcpu).regs) } {
-        return unsafe { (*vcpu).active.load(Ordering::Acquire) };
-    }
-    unsafe { (*vcpu).regs.rax = 1 };
+    unsafe { capture_registers(&mut (*vcpu).regs) };
 
     match unsafe { setup_vmcs(vcpu) } {
         Ok(true) => {}
@@ -577,6 +688,9 @@ pub unsafe fn init_cpu(vcpu: *mut Vcpu, cpu: u32) -> bool {
     // VMX allocation reachable from this vCPU.
     unsafe { (*vcpu).active.store(true, Ordering::Release) };
     let rflags = unsafe { launch_vm(&mut (*vcpu).regs, 0) };
+    if rflags == 0 {
+        return unsafe { (*vcpu).active.load(Ordering::Acquire) };
+    }
     unsafe { handle(rflags, &mut *vcpu) };
     vmxoff_or_halt();
     unsafe { (*vcpu).active.store(false, Ordering::Release) };

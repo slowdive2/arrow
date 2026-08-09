@@ -9,7 +9,10 @@
 // https://github.com/memN0ps/illusion-rs/blob/main/hypervisor/src/intel/support.rs
 
 #![allow(dead_code)]
-use core::arch::asm;
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use wdk_sys::ntddk::KeIpiGenericCall;
 
 pub fn vmxon(vmxon_region: u64) -> x86::vmx::Result<()> {
@@ -60,17 +63,41 @@ unsafe fn vmcall_watch_exec_here(gpa: u64) -> bool {
     status == 0
 }
 
-unsafe extern "system" fn watch_exec_cpu(gpa: usize) -> usize {
-    if unsafe { vmcall_watch_exec_here(gpa as u64) } {
-        1
-    } else {
-        0
+struct WatchExecBroadcast<'a> {
+    gpa: u64,
+    guard: &'a crate::vmm::VmmClientGuard,
+    ok: AtomicBool,
+    visited: AtomicBool,
+}
+
+unsafe extern "system" fn watch_exec_cpu(context: usize) -> usize {
+    let context = unsafe { &*(context as *const WatchExecBroadcast<'_>) };
+    if !unsafe { crate::vmm::current_cpu_virtualized(context.guard) } {
+        // Hot-added or already-devirtualized CPUs have no EPT cache to flush,
+        // and executing VMCALL on them would raise #UD.
+        return 1;
     }
+
+    context.visited.store(true, Ordering::Release);
+    if !unsafe { vmcall_watch_exec_here(context.gpa) } {
+        context.ok.store(false, Ordering::Release);
+    }
+    1
 }
 
 // each cpu runs vmcall so each one flushes its cached ept entry
 pub unsafe fn vmcall_watch_exec(gpa: u64) -> bool {
-    unsafe { KeIpiGenericCall(Some(watch_exec_cpu), gpa as usize) != 0 }
+    let Some(guard) = crate::vmm::VmmClientGuard::try_acquire() else {
+        return false;
+    };
+    let context = WatchExecBroadcast {
+        gpa,
+        guard: &guard,
+        ok: AtomicBool::new(true),
+        visited: AtomicBool::new(false),
+    };
+    unsafe { KeIpiGenericCall(Some(watch_exec_cpu), core::ptr::from_ref(&context) as usize) };
+    context.visited.load(Ordering::Acquire) && context.ok.load(Ordering::Acquire)
 }
 
 // write xcr0 when osxsave is on

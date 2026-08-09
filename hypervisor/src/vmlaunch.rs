@@ -14,6 +14,9 @@ use {
 };
 
 extern "efiapi" {
+    // Initial launch returns zero from .LaunchSuccess in VMX non-root mode.
+    // VM-entry failure returns the VM instruction's RFLAGS; a successful
+    // resume continues the guest and does not return here.
     pub fn launch_vm(regs: &mut GuestRegs, launched: u64) -> u64;
     pub fn restore_guest(regs: &GuestRegs) -> !;
     pub fn vmexit_entry();
@@ -154,13 +157,42 @@ launch_vm:
     jmp     .VmEntryFailure
 
 .Launch:
+    // Return from this one FFI call in VMX non-root mode after VMLAUNCH.
+    // This avoids resuming an earlier Rust call site as a returns-twice
+    // function, which Rust cannot express on the stable toolchain.
+    mov     r14, {vmcs_guest_rsp}
+    vmwrite r14, rsp
+    jbe     .VmEntryFailure
+    lea     r13, [rip + .LaunchSuccess]
+    mov     r14, {vmcs_guest_rip}
+    vmwrite r14, r13
+    jbe     .VmEntryFailure
+
     mov     r13, [r15 + {registers_r13}]
     mov     r14, [r15 + {registers_r14}]
     mov     r15, [r15 + {registers_r15}]
     vmlaunch
 
 .VmEntryFailure:
+    // RESTORE_XMM adjusts RSP with ADD and therefore destroys VMX's CF/ZF
+    // result. Replace PUSHAQ's saved RAX with RFLAGS so POPAQ returns the
+    // original VM-instruction status to Rust.
+    pushfq
+    pop     rax
+    mov     [rsp + {launch_saved_rax}], rax
     jmp     .Exit
+
+.LaunchSuccess:
+    pop     rax
+
+    RESTORE_XMM
+
+    POPAQ
+
+    // Zero is reserved for a successful initial launch. VM-entry failure
+    // returns RFLAGS, whose reserved bit 1 is always set.
+    xor     eax, eax
+    ret
 
 .Exit:
     pop     rax
@@ -168,9 +200,6 @@ launch_vm:
     RESTORE_XMM
 
     POPAQ
-
-    pushfq
-    pop     rax
     ret
 
 .global vmexit_entry
@@ -301,4 +330,9 @@ restore_guest:
     registers_xmm14 = const mem::offset_of!(GuestRegs, xmm14),
     registers_xmm15 = const mem::offset_of!(GuestRegs, xmm15),
     vcpu_regs = const mem::offset_of!(Vcpu, regs),
+    vmcs_guest_rsp = const x86::vmx::vmcs::guest::RSP,
+    vmcs_guest_rip = const x86::vmx::vmcs::guest::RIP,
+    // From the pushed regs pointer, skip it, the XMM save area, and the
+    // fourteen PUSHAQ slots below the original RAX slot.
+    launch_saved_rax = const 8 + 0x100 + 14 * mem::size_of::<u64>(),
 );

@@ -2,7 +2,11 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{
+    alloc::{alloc, Layout},
+    boxed::Box,
+    vec::Vec,
+};
 use core::{
     hint::spin_loop,
     ptr,
@@ -97,14 +101,49 @@ impl Ept {
             .with_pml4_pfn(pml4_pa >> EPT_PAGE_SHIFT)
             .into_bits();
 
-        let mut ept = Box::new(Self {
-            map,
-            eptp,
-            default_type,
-            mtrrs: mtrrs.to_vec(),
-            free_pts: Vec::with_capacity(SPLIT_COUNT + 1),
-            splits: Vec::with_capacity(SPLIT_COUNT + 1),
-        });
+        let mut owned_mtrrs = Vec::new();
+        if owned_mtrrs.try_reserve_exact(mtrrs.len()).is_err() {
+            log::error!("failed to reserve the EPT MTRR map");
+            unsafe { MmFreeContiguousMemory(map.as_ptr().cast()) };
+            return None;
+        }
+        owned_mtrrs.extend_from_slice(mtrrs);
+
+        let mut free_pts = Vec::new();
+        if free_pts.try_reserve_exact(SPLIT_COUNT + 1).is_err() {
+            log::error!("failed to reserve the free EPT split-page list");
+            unsafe { MmFreeContiguousMemory(map.as_ptr().cast()) };
+            return None;
+        }
+
+        let mut splits = Vec::new();
+        if splits.try_reserve_exact(SPLIT_COUNT + 1).is_err() {
+            log::error!("failed to reserve the active EPT split list");
+            unsafe { MmFreeContiguousMemory(map.as_ptr().cast()) };
+            return None;
+        }
+
+        let ept = unsafe { alloc(Layout::new::<Self>()).cast::<Self>() };
+        if ept.is_null() {
+            log::error!("failed to allocate the EPT owner");
+            unsafe { MmFreeContiguousMemory(map.as_ptr().cast()) };
+            return None;
+        }
+
+        unsafe {
+            ptr::write(
+                ept,
+                Self {
+                    map,
+                    eptp,
+                    default_type,
+                    mtrrs: owned_mtrrs,
+                    free_pts,
+                    splits,
+                },
+            )
+        };
+        let mut ept = unsafe { Box::from_raw(ept) };
 
         for _ in 0..=SPLIT_COUNT {
             let pt = NonNull::new(unsafe {

@@ -7,7 +7,9 @@ use core::{
 };
 
 use bitfield_struct::bitfield;
-use x86::msr::{rdmsr, IA32_FS_BASE, IA32_GS_BASE};
+use x86::msr::{
+    rdmsr, IA32_FS_BASE, IA32_GS_BASE, IA32_SYSENTER_CS, IA32_SYSENTER_EIP, IA32_SYSENTER_ESP,
+};
 use x86::vmx::vmcs::{
     self,
     control::{EntryControls, ExitControls, PrimaryControls, SecondaryControls},
@@ -37,7 +39,7 @@ pub struct M128A {
 }
 
 unsafe extern "win64" {
-    pub fn capture_registers(registers: &mut GuestRegs) -> bool;
+    pub fn capture_registers(registers: &mut GuestRegs);
 }
 
 // vmcs segment access rights
@@ -154,7 +156,7 @@ capture_registers:
     movaps  [rcx + {registers_xmm14}], xmm14
     movaps  [rcx + {registers_xmm15}], xmm15
 
-    // first pass returns false
+    // RAX is volatile across the call.
     xor     eax, eax
     ret
 "#,
@@ -294,6 +296,9 @@ pub unsafe fn setup_guest_state(guest_desc: &Descriptors, regs: &GuestRegs) -> V
         // long mode
         vmwrite(vmcs::guest::FS_BASE, rdmsr(IA32_FS_BASE))?;
         vmwrite(vmcs::guest::GS_BASE, rdmsr(IA32_GS_BASE))?;
+        vmwrite(vmcs::guest::IA32_SYSENTER_CS, rdmsr(IA32_SYSENTER_CS))?;
+        vmwrite(vmcs::guest::IA32_SYSENTER_ESP, rdmsr(IA32_SYSENTER_ESP))?;
+        vmwrite(vmcs::guest::IA32_SYSENTER_EIP, rdmsr(IA32_SYSENTER_EIP))?;
 
         vmwrite(vmcs::guest::LDTR_BASE, 0u64)?;
         vmwrite(vmcs::guest::TR_BASE, guest_desc.tss_base)?;
@@ -352,6 +357,9 @@ pub unsafe fn setup_host_state(
 
         vmwrite(vmcs::host::FS_BASE, rdmsr(IA32_FS_BASE))?;
         vmwrite(vmcs::host::GS_BASE, rdmsr(IA32_GS_BASE))?;
+        vmwrite(vmcs::host::IA32_SYSENTER_CS, rdmsr(IA32_SYSENTER_CS))?;
+        vmwrite(vmcs::host::IA32_SYSENTER_ESP, rdmsr(IA32_SYSENTER_ESP))?;
+        vmwrite(vmcs::host::IA32_SYSENTER_EIP, rdmsr(IA32_SYSENTER_EIP))?;
         vmwrite(vmcs::host::TR_BASE, host_desc.tss_base)?;
         vmwrite(vmcs::host::GDTR_BASE, host_desc.gdtr.base as u64)?;
         vmwrite(vmcs::host::IDTR_BASE, host_desc.idtr.base as u64)?;

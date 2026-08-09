@@ -29,9 +29,9 @@ pub unsafe extern "system" fn driver_entry(
 }
 
 unsafe extern "C" fn driver_exit(_driver: *mut DRIVER_OBJECT) {
-    if !unsafe { hypervisor::vmm::vmm_shutdown() } {
-        log::error!("driver unload failed");
-        loop {
+    while !unsafe { hypervisor::vmm::vmm_shutdown() } {
+        log::error!("driver unload incomplete; retrying");
+        for _ in 0..1024 {
             core::hint::spin_loop();
         }
     }

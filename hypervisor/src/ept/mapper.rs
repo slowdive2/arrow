@@ -98,12 +98,17 @@ const _: () = {
     assert!(size_of::<EptPageMap>() == EPT_PAGE_SIZE * (EPT_ENTRY_COUNT + 2));
 };
 
-pub fn build_mtrr_map() -> Vec<MtrrRange> {
+pub fn build_mtrr_map() -> Option<Vec<MtrrRange>> {
     let cap = MtrrCap::from_bits(rdmsr(IA32_MTRRCAP));
     let def = MtrrDefType::from_bits(rdmsr(IA32_MTRR_DEF_TYPE));
     let fixed_enabled = cap.fixed_supported() && def.fixed_enabled();
-    let fixed_count = if fixed_enabled { 88 } else { 0 };
-    let mut ranges = Vec::with_capacity(usize::from(cap.var_count()) + fixed_count);
+    let fixed_count = if fixed_enabled { 88usize } else { 0 };
+    let capacity = usize::from(cap.var_count()) + fixed_count;
+    let mut ranges = Vec::new();
+    if ranges.try_reserve_exact(capacity).is_err() {
+        log::error!("failed to reserve the MTRR map");
+        return None;
+    }
 
     if fixed_enabled {
         push_fixed_ranges(&mut ranges, rdmsr(IA32_MTRR_FIX64K_00000), 0, 0x1_0000);
@@ -143,7 +148,7 @@ pub fn build_mtrr_map() -> Vec<MtrrRange> {
     }
 
     log::debug!("committed {} MTRR ranges", ranges.len());
-    ranges
+    Some(ranges)
 }
 
 fn push_fixed_ranges(ranges: &mut Vec<MtrrRange>, value: u64, start: u64, size: u64) {
