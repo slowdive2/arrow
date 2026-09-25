@@ -1,3 +1,4 @@
+(see https://github.com/slowdive2/monad)
 # 04 Sept. : arrow is being extended privately for future project; no longer maintained
 
 # Arrow is a minimal hypervisor written in Rust
