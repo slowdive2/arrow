@@ -7,11 +7,11 @@ Currently supports VM-exit handling, MSR interception, exception injection, and 
 The EPT subsystem currently identity-maps & derives memory-types from MTRRs, maintaining similarity with the original guest being hyperjacked. 2mb - 4kB page splitting + execution monitoring is currently supported. 
 [EPT implementation here](hypervisor/src/ept)
 
-# WIP:
+# WIP
 - vmx non-root (user level) hooking calls &&
 - something more interesting than 1 shot exec monitoring
 
-# Long term:
+# Long term
 - formal verification experiments
 - various stealth-based hooking techniques
 - debugging capabilities
